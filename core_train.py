@@ -12,11 +12,22 @@ from lightning.fabric.strategies.model_parallel import ModelParallelStrategy
 from torch.distributed.fsdp import fully_shard
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from model_base import ModelBase
 from model_bst import BST, BSTConfig
 from model_gpt import GPT, GPTConfig, Block
+
+# flaatten the metric json - make the csv more readable with more columns
+def _flatten_metrics(metrics: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
+    flattened = {}
+    for key, value in metrics.items():
+        name = f"{prefix}/{key}" if prefix else key
+        if isinstance(value, dict):
+            flattened.update(_flatten_metrics(value, name))
+        else:
+            flattened[name] = value
+    return flattened
 
 
 def initialize_model(
@@ -448,13 +459,14 @@ class Trainer:
                         "epoch": self.epoch,
                         "lr": lr,
                         "train_loss": self.last_train_loss,
+                        "_raw_custom_metrics": custom_metrics,
                         **validation_logs,
-                        **custom_metrics,
+                        **_flatten_metrics(custom_metrics),
                     }
                     if grad_norm is not None:
                         log_dict["grad_norm"] = grad_norm
 
-                    self.fabric.log_dict(log_dict)
+                    self.fabric.log_dict(log_dict, step=self.step)
 
                 # Update progress bar
                 progress_str = f"{datetime.now()} Step: {self.step} Epoch: {self.epoch} Train loss: {self.last_train_loss or 0.0:.4f}"

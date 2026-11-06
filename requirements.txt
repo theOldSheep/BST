@@ -3,7 +3,8 @@ transformers
 datasets
 omegaconf>=2.3.0
 wandb
-trl
+trl==0.19.1
 scikit-learn
 lightning
 liger-kernel
+matplotlib

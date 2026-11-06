@@ -15,7 +15,7 @@ import lightning as L
 from dataclasses import dataclass
 from lightning.fabric import is_wrapped
 from torch.distributed.fsdp import FSDPModule
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 from model_base import (
     ModelBase,
@@ -84,7 +84,8 @@ class TextHead(FusedCrossEntropyLoss, nn.Module):
         backward_embedding: torch.Tensor,
         targets_next: Optional[torch.Tensor] = None,
         targets_prev: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_accuracy: bool = False, # will be provided with true if backprop is on
+    )-> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]: # returns either 
         # Shape of each embedding is (batch_size, n_embd)
         # Input to hidden layers has shape (batch_size, n_embd * 2)
         x = torch.cat([forward_embedding, backward_embedding], dim=-1)
@@ -110,21 +111,54 @@ class TextHead(FusedCrossEntropyLoss, nn.Module):
         # If targets are given, use fused kernel to compute loss
         else:
             loss_next, loss_prev = None, None
+            accuracy_next, accuracy_prev = None, None
 
             if targets_next is not None:
-                loss_next = self.cross_entropy_loss(
-                    input=x_next,
-                    last_layer=self.lm_head,
-                    targets=targets_next,
-                )
+                if return_accuracy:
+                    loss_next, accuracy_next = self._cross_entropy_loss_with_accuracy(
+                        input=x_next,
+                        targets=targets_next,
+                    )
+                else:
+                    loss_next = self.cross_entropy_loss(
+                        input=x_next,
+                        last_layer=self.lm_head,
+                        targets=targets_next,
+                    )
             if targets_prev is not None:
-                loss_prev = self.cross_entropy_loss(
-                    input=x_prev,
-                    last_layer=self.lm_head,
-                    targets=targets_prev,
-                )
+                if return_accuracy:
+                    loss_prev, accuracy_prev = self._cross_entropy_loss_with_accuracy(
+                        input=x_prev,
+                        targets=targets_prev,
+                    )
+                else:
+                    loss_prev = self.cross_entropy_loss(
+                        input=x_prev,
+                        last_layer=self.lm_head,
+                        targets=targets_prev,
+                    )
 
+            if return_accuracy:
+                return loss_next, loss_prev, accuracy_next, accuracy_prev
             return loss_next, loss_prev
+
+    # the variant of CE loss but also returns accuracy info
+    def _cross_entropy_loss_with_accuracy(
+        self, input: torch.Tensor, targets: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        input_flat = input.reshape(-1, input.size(-1))
+        targets_flat = targets.reshape(-1)
+
+        if self.config.use_fused:
+            loss = self.cross_entropy_loss(input, self.lm_head, targets)
+            with torch.no_grad():
+                accuracy = self.lm_head(input_flat).argmax(dim=-1) == targets_flat
+        else:
+            logits = self.lm_head(input_flat)
+            loss = F.cross_entropy(logits, targets_flat)
+            accuracy = logits.detach().argmax(dim=-1) == targets_flat
+
+        return loss, accuracy.reshape(targets.shape)
 
     def get_num_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
@@ -344,6 +378,8 @@ class BST(ModelBase):
         self._avg_valid_pairs = None
         self._avg_sampled_pairs = None
         self._n_iters_averaged = 0
+        self._pair_accuracy_counts = None
+        self._pair_accuracy_correct = None
 
     def get_num_params(self, non_embedding: bool = True) -> int:
         """
@@ -514,12 +550,73 @@ class BST(ModelBase):
 
     def get_custom_metrics(self) -> Dict[str, Any]:
         """
-        Return pair statistics for logging
+        Return pair statistics and interval-averaged pair-index accuracies for logging.
         """
-        return {
+        metrics = {
             "avg_valid_pairs": self._avg_valid_pairs,
             "avg_sampled_pairs": self._avg_sampled_pairs,
         }
+
+        if self._pair_accuracy_counts is not None:
+            # sum up count & sum over workers
+            accuracy_stats = torch.cat(
+                [
+                    self._pair_accuracy_counts.unsqueeze(0),
+                    self._pair_accuracy_correct,
+                ],
+                dim=0,
+            )
+            if self.fabric.world_size > 1:
+                accuracy_stats = self.fabric.all_reduce(
+                    accuracy_stats, reduce_op="sum"
+                )
+
+            # compute acc.
+            counts = accuracy_stats[0]
+            correct = accuracy_stats[1:]
+            observed = torch.nonzero(counts, as_tuple=False).flatten()
+            if observed.numel() > 0:
+                per_pair_accuracy = correct[:, observed].float() / counts[observed]
+                metrics["pair_accuracy_next"] = per_pair_accuracy[0].mean().item()
+                metrics["pair_accuracy_prev"] = per_pair_accuracy[1].mean().item()
+
+                block_size = self.config.block_size
+                pair_indices = observed.cpu().tolist()
+                next_accuracy = per_pair_accuracy[0].cpu().tolist()
+                prev_accuracy = per_pair_accuracy[1].cpu().tolist()
+                metrics["pair_accuracy_by_index"] = {
+                    f"{index // block_size},{index % block_size}": {
+                        "next": next_acc,
+                        "prev": prev_acc,
+                    }
+                    for index, next_acc, prev_acc in zip(
+                        pair_indices, next_accuracy, prev_accuracy
+                    )
+                }
+            else:
+                metrics["pair_accuracy_by_index"] = {}
+
+            self._pair_accuracy_counts.zero_()
+            self._pair_accuracy_correct.zero_()
+
+        return metrics
+
+    def _record_pair_accuracy(
+        self,
+        pair_idx: torch.Tensor,
+        accuracy_next: torch.Tensor,
+        accuracy_prev: torch.Tensor,
+    ):
+        block_size = self.config.block_size
+        flat_indices = pair_idx[:, 0] * block_size + pair_idx[:, 1]
+        self._pair_accuracy_counts.index_add_(
+            0, flat_indices, torch.ones_like(flat_indices)
+        )
+        self._pair_accuracy_correct.index_add_(
+            1,
+            flat_indices,
+            torch.stack([accuracy_next, accuracy_prev]).to(dtype=torch.long),
+        )
 
     def compute_loss(
         self,
@@ -537,6 +634,15 @@ class BST(ModelBase):
         Returns loss over all valid pairs, divided by loss_div, and detached.
         """
         self._assert_fabric_is_setup()
+
+        if backpropagate and self._pair_accuracy_counts is None:
+            n_pair_indices = self.config.block_size * self.config.block_size
+            self._pair_accuracy_counts = torch.zeros(
+                n_pair_indices, dtype=torch.long, device=batch.device
+            )
+            self._pair_accuracy_correct = torch.zeros(
+                2, n_pair_indices, dtype=torch.long, device=batch.device
+            )
 
         # batch has shape (batch_size, seq_len)
         batch_size, _ = batch.shape
@@ -676,12 +782,22 @@ class BST(ModelBase):
             if isinstance(self.text_head.module, FSDPModule):
                 self.text_head.module.set_reshard_after_backward(not no_sync)
 
-            loss_next, loss_prev = self.text_head(
-                forward_batch,
-                backward_batch,
-                targets_next=targets_next,
-                targets_prev=targets_prev,
-            )
+            if backpropagate:
+                loss_next, loss_prev, accuracy_next, accuracy_prev = self.text_head(
+                    forward_batch,
+                    backward_batch,
+                    targets_next=targets_next,
+                    targets_prev=targets_prev,
+                    return_accuracy=True,
+                )
+                self._record_pair_accuracy(pair_idx, accuracy_next, accuracy_prev)
+            else:
+                loss_next, loss_prev = self.text_head(
+                    forward_batch,
+                    backward_batch,
+                    targets_next=targets_next,
+                    targets_prev=targets_prev,
+                )
 
             loss = (loss_next + loss_prev) / 2.0
             loss = loss / loss_div

@@ -1,3 +1,32 @@
+# A fork of the original 
+
+# Stargraph - train
+To start Ubuntu
+> wsl
+
+cd /mnt/c/Users/User/Desktop/coding/AI/stargraph_LLM/BST
+source ~/venv/bin/activate
+
+Data preparation:
+> python data/stargraph/prepare.py --num_samples 1000000 --num_paths 5 --path_length 5 --max_nodes 50
+Baseline:
+> python train.py --config config/gpt_stargraph_mini.yaml data.stargraph_data_path="data/stargraph/graph_5_5_sample_10000000.txt"
+Belief State Transformer:
+> python train.py --config config/bst_stargraph_mini.yaml data.stargraph_data_path="data/stargraph/graph_5_5_sample_1000000.txt"
+
+# Stargraph - visualize
+
+When file logging is enabled, visualize pair accuracy metric with:
+Set-ExecutionPolicy Unrestricted -Scope Process
+.\windows_venv\Scripts\activate.ps1
+
+python visualize_pair_accuracy.py out/REPLACE_THIS/version_0/metrics.csv
+
+
+
+# Below: readme from original repo
+
+
 # The Belief State Transformer
 ICLR 2025 \
 [Edward S. Hu](https://edwardshu.com/) <sup>1,2</sup>,

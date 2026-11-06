@@ -1,0 +1,50 @@
+# Use BST if true, otherwise use GPT
+use_bst: false
+
+trainer:
+  train_batches: 30000
+  val_batches: 200
+  val_only: false
+  log_interval: 1
+  val_interval: 5000
+  out_dir: out/vanilla
+  init_from: scratch
+  log_to_file: true
+  log_to_wandb: false
+  wandb_project: ""
+  compile: true
+
+data:
+  dataset: stargraph
+  effective_batch_size: 512
+  gradient_accum_steps: 1
+  pair_accum_steps: 1
+  goal_range: [25, 75]
+  num_workers: 0
+  stargraph_data_path: "data/stargraph/graph_5_5_sample_10000000.txt"
+  stargraph_max_nodes: 50
+
+model:
+  n_layer: 8
+  n_head: 4
+  n_embd: 256
+  dropout: 0.0
+  bias: false
+  vocab_size: 0 #will be overwritten by datamodule
+  block_size: 512
+  context_length: 0
+  gpt_mode: next_token
+  bst_pair_minimum_gap: 2
+
+optimizer:
+  learning_rate: 1e-4 #without bst's grad augmentation, lower lr & larger batch size
+  weight_decay: 0.0
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: null
+
+lr_scheduler:
+  decay_lr: false
+  warmup_iters: 100
+  lr_decay_iters: 600000
+  min_lr: 0.0002

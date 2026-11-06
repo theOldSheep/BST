@@ -15,7 +15,7 @@ import lightning as L
 from dataclasses import dataclass
 from lightning.fabric import is_wrapped
 from torch.distributed.fsdp import FSDPModule
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 from model_base import (
     ModelBase,
@@ -251,7 +251,8 @@ class Transformer(DocumentRelativePositions, FusedCrossEntropyLoss, nn.Module):
         batch: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         targets: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        return_accuracy: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         batch_size, seq_len = batch.size()
         assert (
             seq_len <= self.config.block_size
@@ -279,6 +280,18 @@ class Transformer(DocumentRelativePositions, FusedCrossEntropyLoss, nn.Module):
 
         # If targets are given, compute loss
         else:
+            if return_accuracy:
+                loss = self.cross_entropy_loss(
+                    input=x,
+                    last_layer=self.lm_head,
+                    targets=targets,
+                )
+                with torch.no_grad():
+                    logits = self.lm_head(x.reshape(-1, x.size(-1)))
+                    accuracy = logits.argmax(dim=-1).reshape_as(targets) == targets
+                    accuracy.masked_fill_(targets == -100, False)
+                return loss, accuracy
+
             return self.cross_entropy_loss(
                 input=x,
                 last_layer=self.lm_head,
@@ -310,6 +323,8 @@ class GPT(ModelBase):
 
         self.config = config
         self.model = Transformer(config)
+        self._pair_accuracy_counts = None
+        self._pair_accuracy_correct = None
 
     def setup_fabric(self, fabric: L.Fabric):
         """
@@ -353,11 +368,25 @@ class GPT(ModelBase):
             # Set masked targets to ignore_index=-100
             targets = targets.masked_fill(fim_mask.logical_not(), -100)
 
+        if backpropagate and self._pair_accuracy_counts is None:
+            self._pair_accuracy_counts = torch.zeros(
+                self.config.block_size, dtype=torch.long, device=batch.device
+            )
+            self._pair_accuracy_correct = torch.zeros(
+                self.config.block_size, dtype=torch.long, device=batch.device
+            )
+
         # If using FSDP, we ignore no_sync and always sync gradients
         # This allows us to re-shard each layer of the model after backward pass
         is_fsdp = isinstance(self.model.module, FSDPModule)
         with self.fabric.no_backward_sync(self.model, no_sync and not is_fsdp):
-            loss = self.model(inputs, targets=targets)
+            if backpropagate:
+                loss, accuracy = self.model(
+                    inputs, targets=targets, return_accuracy=True
+                )
+                self._record_pair_accuracy(accuracy, targets)
+            else:
+                loss = self.model(inputs, targets=targets)
             loss = loss / loss_div
 
             # Backward pass
@@ -365,6 +394,53 @@ class GPT(ModelBase):
                 self.fabric.backward(loss)
 
         return loss.detach()
+
+    def _record_pair_accuracy(
+        self, accuracy: torch.Tensor, targets: torch.Tensor
+    ):
+        valid = targets != -100
+        seq_len = targets.size(1)
+        self._pair_accuracy_counts[:seq_len].add_(valid.sum(dim=0))
+        self._pair_accuracy_correct[:seq_len].add_(accuracy.sum(dim=0))
+
+    def get_custom_metrics(self) -> Dict[str, Any]:
+        if self._pair_accuracy_counts is None:
+            return {}
+
+        accuracy_stats = torch.stack(
+            [self._pair_accuracy_counts, self._pair_accuracy_correct]
+        )
+        if self.fabric.world_size > 1:
+            accuracy_stats = self.fabric.all_reduce(accuracy_stats, reduce_op="sum")
+
+        counts = accuracy_stats[0]
+        correct = accuracy_stats[1]
+        observed = torch.nonzero(counts, as_tuple=False).flatten()
+        if observed.numel() > 0:
+            per_position_accuracy = correct[observed].float() / counts[observed]
+            observed_indices = observed.cpu().tolist()
+            position_accuracy = per_position_accuracy.cpu().tolist()
+            metrics = {
+                "pair_accuracy_next": per_position_accuracy.mean().item(),
+                "pair_accuracy_prev": None,
+                "pair_accuracy_by_index": {
+                    f"{index},-1": {
+                        "next": accuracy,
+                        "prev": None,
+                    }
+                    for index, accuracy in zip(observed_indices, position_accuracy)
+                },
+            }
+        else:
+            metrics = {
+                "pair_accuracy_next": None,
+                "pair_accuracy_prev": None,
+                "pair_accuracy_by_index": {},
+            }
+
+        self._pair_accuracy_counts.zero_()
+        self._pair_accuracy_correct.zero_()
+        return metrics
 
     def configure_optimizers(
         self,
