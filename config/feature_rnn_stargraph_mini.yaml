@@ -1,0 +1,58 @@
+use_bst: false
+
+trainer:
+  train_batches: 6000
+  val_batches: 200
+  val_only: false
+  log_interval: 1
+  val_interval: 1000
+  out_dir: out/feature_rnn
+  init_from: scratch
+  log_to_file: true
+  log_to_wandb: false
+  wandb_project: ""
+  compile: true
+
+data:
+  dataset: stargraph
+  effective_batch_size: 240
+  gradient_accum_steps: 10
+  pair_accum_steps: 1
+  goal_range: [25, 75]
+  num_workers: 0
+  stargraph_data_path: "data/stargraph/graph_5_5_sample_10000000.txt"
+  stargraph_max_nodes: 50
+
+model:
+  architecture: feature_rnn
+  n_layer: 8
+  n_head: 16
+  n_embd: 256
+  dropout: 0.0
+  bias: false
+  vocab_size: 0 #will be overwritten by datamodule
+  block_size: 512
+  context_length: 0
+  gpt_mode: next_token
+  feature_selection_layers: 4
+  feature_selection_heads: 16
+  feature_selection_backward_distance: 7
+  muon_momentum: 0.95
+  rope_enabled_for_inference: false
+  recurrent_inference: false
+  n_fixed_feature_embeddings: 16
+  n_model_split_u: 16
+  n_model_split_v: 16
+
+optimizer:
+  learning_rate: 3e-4
+  weight_decay: 0.0
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: null
+
+lr_scheduler:
+  decay_lr: false
+  warmup_iters: 100
+  lr_decay_iters: 600000
+  min_lr: 0.0002

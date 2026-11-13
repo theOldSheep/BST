@@ -15,6 +15,7 @@ from typing import List, Optional, Tuple, Union
 from core_train import initialize_model
 from data.tinystories import TinyStoriesDataModule
 from model_bst import BST
+from model_feature_rnn import FeatureRNN
 from model_gpt import GPT
 
 
@@ -102,7 +103,7 @@ class Inference:
         self,
         fabric: L.Fabric,
         config,
-        model: Union[BST, GPT],
+        model: Union[BST, GPT, BeliefRNN, FeatureRNN],
         tokenizer,
         top_k: int = None,  # limit sampling to top K next tokens
         add_eos_token: bool = True,  # add EOS token to start of prompt and end of goal
@@ -164,8 +165,13 @@ class Inference:
             goal = batch[i, -suffix_len:]
 
             # Sampling methods for GPT model
-            if isinstance(model, GPT):
+            if isinstance(model, (GPT, FeatureRNN)):
                 if config.model.gpt_mode == "fim":
+                    if isinstance(model, (FeatureRNN)):
+                        raise ValueError(
+                            f"{type(model).__name__} supports only next-token "
+                            "mode; FIM infilling is not supported."
+                        )
                     # For FIM mode, create new prompt with suffix and FIM token
                     fim_tensor = torch.tensor(
                         [model.config.fim_token_id],
@@ -225,7 +231,8 @@ class Inference:
                     )
             else:
                 raise ValueError(
-                    f"Model not valid. {type(model)} is not supported. Must be either BST or GPT."
+                    f"Model not valid. {type(model)} is not supported. "
+                    "Must be BST, GPT, or FeatureRNN."
                 )
 
     def _untokenize(self, tokens: torch.Tensor) -> str:

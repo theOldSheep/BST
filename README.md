@@ -13,6 +13,8 @@ Baseline:
 > python train.py --config config/gpt_stargraph_mini.yaml data.stargraph_data_path="data/stargraph/graph_5_5_sample_10000000.txt"
 Belief State Transformer:
 > python train.py --config config/bst_stargraph_mini.yaml data.stargraph_data_path="data/stargraph/graph_5_5_sample_1000000.txt"
+Feature RNN:
+> python train.py --config config/feature_rnn_stargraph_mini.yaml data.stargraph_data_path="data/stargraph/graph_5_5_sample_1000000.txt"
 
 # Stargraph - visualize
 

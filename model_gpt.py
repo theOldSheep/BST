@@ -39,6 +39,7 @@ class GPTConfig:
     # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     bias: bool = False
     goal_range: Tuple[int] = (25, 75)
+    context_length: int = 0
     eos_token_id: int = -1
     fim_token_id: int = -1
     is_fim_mode: bool = False
@@ -367,6 +368,15 @@ class GPT(ModelBase):
             fim_mask = self._get_fim_loss_mask_fast(targets)
             # Set masked targets to ignore_index=-100
             targets = targets.masked_fill(fim_mask.logical_not(), -100)
+        # Based on experiment, masking out prediction on prefix hinders convergence
+        # Although edge token prediction introduces token-wise entropy from randomness and permutation
+        # Prediction on edges seems to augment gradient & allow model to learn the question better
+        # if not 0 <= self.config.context_length < targets.size(1):
+        #     raise ValueError(f"context_length must be in [0, {targets.size(1) - 1}], got {self.config.context_length}")
+        # target_positions = torch.arange(targets.size(1), device=targets.device)
+        # targets = targets.masked_fill(
+        #     (target_positions < self.config.context_length).unsqueeze(0), -100
+        # )
 
         if backpropagate and self._pair_accuracy_counts is None:
             self._pair_accuracy_counts = torch.zeros(

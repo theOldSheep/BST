@@ -71,9 +71,17 @@ data:
   stargraph_max_nodes: 50
 
 model:
+  # "gpt" or "feature_rnn" when use_bst is false
+  architecture: gpt
   n_layer: 8
   n_head: 8
   n_embd: 768
+  # Loss multipliers for encoded state's pairwise reconstruction via decoder
+  pair_reconstruction_loss_weight: 1.0
+  # Loss multipliers for next token generation analogous to the actual inference call
+  inference_loss_weight: 1.0
+  # Loss multiplier for matching inferencer outputs to the final encoder state
+  inference_encoding_mse_weight: 1.0
   dropout: 0.0
   bias: false
   # Total number of tokens in the vocabulary
@@ -92,6 +100,20 @@ model:
   bst_pair_subsample_rate: 1.0
   # What to predict for gap size 1: "next_token" or "eos"
   bst_single_gap_prediction_mode: eos
+
+  # Feature RNN specific options
+  # Feature selecion layers - count , head and backward mask window size
+  feature_selection_layers: 4
+  feature_selection_heads: 4
+  feature_selection_backward_distance: 7
+  muon_momentum: 0.95 # TODO - give baseline/bst muon as well
+  # Inference layers options
+  rope_enabled_for_inference: true
+  recurrent_inference: false
+  n_fixed_feature_embeddings: 16
+  # U and V for operation transformation, with UV = n_model and U > V 
+  n_model_split_u: 64
+  n_model_split_v: 4
 
   # GPT specific options
   # "next_token" or "fim"

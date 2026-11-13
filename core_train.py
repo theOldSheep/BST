@@ -17,6 +17,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from model_base import ModelBase
 from model_bst import BST, BSTConfig
 from model_gpt import GPT, GPTConfig, Block
+from model_feature_rnn import (
+    FeatureRNN,
+    FeatureRNNConfig,
+    FeatureRNNBlock,
+    VanillaAttentionBlock as FeatureRNNVanillaAttentionBlock,
+)
 
 # flaatten the metric json - make the csv more readable with more columns
 def _flatten_metrics(metrics: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
@@ -47,8 +53,16 @@ def initialize_model(
             config.model.bst_single_gap_prediction_mode in single_gap_modes
         ), f"BST single gap mode must be one of {single_gap_modes}"
     else:
-        ModelClass = GPT
-        ModelConfigClass = GPTConfig
+        if config.model.architecture == "gpt":
+            ModelClass = GPT
+            ModelConfigClass = GPTConfig
+        elif config.model.architecture == "feature_rnn":
+            ModelClass = FeatureRNN
+            ModelConfigClass = FeatureRNNConfig
+        else:
+            raise ValueError(
+                f"Unknown model architecture: {config.model.architecture}"
+            )
         gpt_modes = ["next_token", "fim"]
         assert (
             config.model.gpt_mode in gpt_modes
@@ -77,11 +91,53 @@ def initialize_model(
             "bst_pair_subsample_rate": config.model.bst_pair_subsample_rate,
             "bst_single_gap_prediction_mode": config.model.bst_single_gap_prediction_mode,
         }
+    elif config.model.architecture in {"feature_rnn"}:
+        if config.model.gpt_mode != "next_token":
+            raise ValueError(
+                f"{config.model.architecture} supports only next-token mode; "
+                "FIM infilling is not supported."
+            )
+        model_args.pop("eos_token_id")
+        feature_defaults = FeatureRNNConfig()
+        model_args.update(
+            context_length=config.model.context_length,
+            feature_selection_layers=config.model.get(
+                "feature_selection_layers", feature_defaults.feature_selection_layers
+            ),
+            feature_selection_heads=config.model.get(
+                "feature_selection_heads", feature_defaults.feature_selection_heads
+            ),
+            feature_selection_backward_distance=config.model.get(
+                "feature_selection_backward_distance",
+                feature_defaults.feature_selection_backward_distance,
+            ),
+            muon_momentum=config.model.get(
+                "muon_momentum", feature_defaults.muon_momentum
+            ),
+            rope_enabled_for_inference=config.model.get(
+                "rope_enabled_for_inference",
+                feature_defaults.rope_enabled_for_inference,
+            ),
+            recurrent_inference=config.model.get(
+                "recurrent_inference", feature_defaults.recurrent_inference
+            ),
+            n_fixed_feature_embeddings=config.model.get(
+                "n_fixed_feature_embeddings",
+                feature_defaults.n_fixed_feature_embeddings,
+            ),
+            n_model_split_u=config.model.get(
+                "n_model_split_u", feature_defaults.n_model_split_u
+            ),
+            n_model_split_v=config.model.get(
+                "n_model_split_v", feature_defaults.n_model_split_v
+            ),
+        )
     else:
         # GPT-specific parameters
         model_args = {
             **model_args,
             "goal_range": config.data.goal_range,
+            "context_length": config.model.context_length,
             "fim_token_id": (
                 -1
                 if config.model.gpt_mode != "fim"
@@ -145,6 +201,8 @@ def initialize_model(
     elif config.trainer.init_from.startswith("gpt2"):  # currently broken @dayan
         fabric.print(f"Initializing from OpenAI GPT-2 weights: {config.init_from}")
         assert not config.use_bst, "BST not supported with GPT-2 weights"
+        if config.model.architecture != "gpt":
+            raise ValueError("OpenAI GPT-2 initialization is only supported for GPT")
         override_args = dict(dropout=config.model.dropout)
         model = ModelClass.from_pretrained(config.trainer.init_from, override_args)
         # read off the created config params, so we can store them into checkpoint correctly
@@ -222,7 +280,16 @@ def shard_model(
     # This lets us only gather full weights one layer at a time
     def _shard_recursive(module: torch.nn.Module):
         for submodule in module.children():
-            if isinstance(submodule, Block):
+            if isinstance(
+                submodule,
+                (
+                    Block,
+                    BeliefRNNBlock,
+                    BeliefRNNCrossAttentionDecoderBlock,
+                    FeatureRNNBlock,
+                    FeatureRNNVanillaAttentionBlock,
+                ),
+            ):
                 submodule = fully_shard(
                     submodule,
                     mesh=device_mesh,
