@@ -5,15 +5,22 @@ from sklearn.model_selection import train_test_split
 
 
 STARGRAPH_VALIDATION_FRACTION = 0.1
+STARGRAPH_TEST_FRACTION = 0.1
 STARGRAPH_SPLIT_SEED = 42
 
 
 def split_stargraph_data(data):
-    return train_test_split(
+    train, eval_test = train_test_split(
         data,
-        test_size=STARGRAPH_VALIDATION_FRACTION,
+        test_size=STARGRAPH_VALIDATION_FRACTION + STARGRAPH_TEST_FRACTION,
         random_state=STARGRAPH_SPLIT_SEED,
     )
+    eval, test = train_test_split(
+        eval_test,
+        test_size=STARGRAPH_TEST_FRACTION / (STARGRAPH_VALIDATION_FRACTION + STARGRAPH_TEST_FRACTION),
+        random_state=STARGRAPH_SPLIT_SEED,
+    )
+    return train, eval, test
 
 
 class Tokenizer:
@@ -100,7 +107,7 @@ class StarGraphDataModule:
             data = f.readlines()
 
         # Split the data into training and validation sets
-        train_data, val_data = split_stargraph_data(data)
+        train_data, val_data, test_data = split_stargraph_data(data)
         self.train_dataset = StarGraphDataset(train_data, self.tokenizer)
         self.val_dataset = StarGraphDataset(val_data, self.tokenizer)
 
