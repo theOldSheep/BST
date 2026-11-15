@@ -6,8 +6,9 @@ trainer:
   val_only: false
   log_interval: 1
   val_interval: 2000
-  out_dir: out
+  out_dir: out/bst
   init_from: scratch
+  log_to_file: true
   wandb_log: false
   wandb_project: ""
   compile: true
@@ -15,7 +16,7 @@ trainer:
 data:
   dataset: stargraph
   effective_batch_size: 256
-  gradient_accum_steps: 1
+  gradient_accum_steps: 4
   pair_accum_steps: 1
   goal_range: [25, 75]
   num_workers: 0
@@ -23,6 +24,7 @@ data:
   stargraph_max_nodes: 50
 
 model:
+  dtype: float32
   n_layer: 6
   n_head: 8
   n_embd: 768

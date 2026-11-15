@@ -1,11 +1,11 @@
 use_bst: false
 
 trainer:
-  train_batches: 6000
+  train_batches: 20000
   val_batches: 200
   val_only: false
   log_interval: 1
-  val_interval: 1000
+  val_interval: 5000
   out_dir: out/feature_rnn
   init_from: scratch
   log_to_file: true
@@ -15,8 +15,8 @@ trainer:
 
 data:
   dataset: stargraph
-  effective_batch_size: 240
-  gradient_accum_steps: 10
+  effective_batch_size: 60
+  gradient_accum_steps: 1
   pair_accum_steps: 1
   goal_range: [25, 75]
   num_workers: 0
@@ -26,29 +26,34 @@ data:
 model:
   architecture: feature_rnn
   n_layer: 8
-  n_head: 16
+  n_head: 8
   n_embd: 256
   dropout: 0.0
-  bias: false
+  bias: true
   vocab_size: 0 #will be overwritten by datamodule
   block_size: 512
   context_length: 0
   gpt_mode: next_token
-  feature_selection_layers: 4
-  feature_selection_heads: 16
+  # Feature attn specific
+  feature_selection_layers: 0
+  feature_selection_heads: 8
   feature_selection_backward_distance: 7
-  muon_momentum: 0.95
-  rope_enabled_for_inference: false
+  rope_enabled_for_inference: true
   recurrent_inference: false
-  n_fixed_feature_embeddings: 16
+  # Number of fixed augmented embedding per attn block
+  n_fixed_feature_embeddings: 0
   n_model_split_u: 16
   n_model_split_v: 16
+  omit_u_matrix: false
+  omit_v_matrix: false
+  orthogonal_regularization_factor: 1.0
 
 optimizer:
   learning_rate: 3e-4
-  weight_decay: 0.0
+  weight_decay: 0.0001
   beta1: 0.9
   beta2: 0.95
+  muon_momentum: 0.95
   grad_clip: null
 
 lr_scheduler:

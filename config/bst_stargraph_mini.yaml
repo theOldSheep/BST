@@ -15,7 +15,7 @@ trainer:
 
 data:
   dataset: stargraph
-  effective_batch_size: 256
+  effective_batch_size: 60
   gradient_accum_steps: 1
   pair_accum_steps: 1
   goal_range: [25, 75]
@@ -24,8 +24,9 @@ data:
   stargraph_max_nodes: 50
 
 model:
+  dtype: float32
   n_layer: 8
-  n_head: 4
+  n_head: 8
   n_embd: 256
   dropout: 0.0
   bias: false

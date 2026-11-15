@@ -76,12 +76,8 @@ model:
   n_layer: 8
   n_head: 8
   n_embd: 768
-  # Loss multipliers for encoded state's pairwise reconstruction via decoder
-  pair_reconstruction_loss_weight: 1.0
-  # Loss multipliers for next token generation analogous to the actual inference call
-  inference_loss_weight: 1.0
-  # Loss multiplier for matching inferencer outputs to the final encoder state
-  inference_encoding_mse_weight: 1.0
+  # "float16", "bfloat16", or "float32"
+  dtype: float16
   dropout: 0.0
   bias: false
   # Total number of tokens in the vocabulary
@@ -106,14 +102,16 @@ model:
   feature_selection_layers: 4
   feature_selection_heads: 4
   feature_selection_backward_distance: 7
-  muon_momentum: 0.95 # TODO - give baseline/bst muon as well
   # Inference layers options
   rope_enabled_for_inference: true
   recurrent_inference: false
   n_fixed_feature_embeddings: 16
   # U and V for operation transformation, with UV = n_model and U > V 
-  n_model_split_u: 64
-  n_model_split_v: 4
+  n_model_split_u: 32
+  n_model_split_v: 24
+  omit_u_matrix: false
+  omit_v_matrix: false
+  orthogonal_regularization_factor: 1.0
 
   # GPT specific options
   # "next_token" or "fim"
@@ -124,7 +122,8 @@ optimizer:
   weight_decay: 0.1
   beta1: 0.9
   beta2: 0.95
-  grad_clip: 1.0
+  muon_momentum: 0.95
+  grad_clip: null
 
 lr_scheduler:
   decay_lr: true

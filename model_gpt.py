@@ -35,6 +35,7 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    dtype: torch.dtype = torch.float16
     dropout: float = 0.0
     # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     bias: bool = False
@@ -190,6 +191,7 @@ class Transformer(DocumentRelativePositions, FusedCrossEntropyLoss, nn.Module):
         self.rotary_embedding = RotaryPositionEmbedding(
             max_seq_len=n_pos_embd,
             head_dim=config.n_embd // config.n_head,
+            dtype=config.dtype,
         )
 
         self.transformer = nn.ModuleDict(
@@ -323,9 +325,11 @@ class GPT(ModelBase):
             ), f"fim_token_id={config.fim_token_id} exceeds vocab size={config.vocab_size}. Did you forget to increment vocab_size to include the FIM token?"
 
         self.config = config
-        self.model = Transformer(config)
+        self.model = Transformer(config).to(dtype=config.dtype)
         self._pair_accuracy_counts = None
         self._pair_accuracy_correct = None
+        self.optimizer_muon: Optional[torch.optim.Optimizer] = None
+        self.optimizer_adamw: Optional[torch.optim.Optimizer] = None
 
     def setup_fabric(self, fabric: L.Fabric):
         """
@@ -340,8 +344,14 @@ class GPT(ModelBase):
             self.fabric.print(self.model)
             self.fabric.print(f"Total number of parameters: {self.get_num_params():,}")
 
-        if self.optimizer is not None and not is_wrapped(self.optimizer):
-            self.optimizer = fabric.setup_optimizers(self.optimizer)
+        if self.optimizer_muon is not None and not is_wrapped(self.optimizer_muon):
+            if self.optimizer_adamw is None:
+                raise RuntimeError("AdamW optimizer was not initialized")
+            self.optimizer_muon, self.optimizer_adamw = fabric.setup_optimizers(
+                self.optimizer_muon, self.optimizer_adamw
+            )
+        if self.optimizer_muon is not None and self.optimizer_adamw is not None:
+            self.optimizer = self.optimizer_muon
 
     def compute_loss(
         self,
@@ -458,31 +468,73 @@ class GPT(ModelBase):
         learning_rate: float,
         betas: Tuple[float, float],
         use_fused: Optional[bool] = None,
+        muon_momentum: float = 0.95,
     ):
         """
-        Create optimizer for training the model
+        Create Muon and AdamW optimizers for training the model.
         """
-        # start with all of the candidate parameters
-        # filter out those that do not require grad
-        param_dict = {
-            pn: p for pn, p in self.model.named_parameters() if p.requires_grad
-        }
+        muon_class = getattr(torch.optim, "Muon", None)
+        if muon_class is None:
+            raise RuntimeError(
+                "GPT requires torch.optim.Muon, available in PyTorch 2.9 and newer."
+            )
 
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {"params": decay_params, "weight_decay": weight_decay},
-            {"params": nodecay_params, "weight_decay": 0.0},
+        named_parameters = [
+            (name, parameter)
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad
         ]
+        # print([name for name, _ in named_parameters])
+        muon_named_parameters = [
+            (name, parameter)
+            for name, parameter in named_parameters
+            if parameter.ndim == 2
+            and not name.endswith("token_embedding.weight")
+            and not name.endswith("lm_head.weight")
+        ]
+        # print([name for name, _ in muon_named_parameters])
+        muon_parameters = [parameter for _, parameter in muon_named_parameters]
+        muon_parameter_ids = {id(parameter) for parameter in muon_parameters}
+        adamw_decay = [
+            parameter
+            for _, parameter in named_parameters
+            if parameter.ndim >= 2 and id(parameter) not in muon_parameter_ids
+        ]
+        adamw_no_decay = [
+            parameter for _, parameter in named_parameters if parameter.ndim < 2
+        ]
+        optimizer_parameter_ids = [
+            id(parameter)
+            for parameter in muon_parameters + adamw_decay + adamw_no_decay
+        ]
+        trainable_ids = {id(parameter) for _, parameter in named_parameters}
+        if (
+            len(optimizer_parameter_ids) != len(set(optimizer_parameter_ids))
+            or set(optimizer_parameter_ids) != trainable_ids
+        ):
+            raise RuntimeError(
+                "Muon and AdamW parameter groups must cover every trainable "
+                "parameter exactly once"
+            )
 
-        # Create AdamW optimizer and use the fused version if it is available
-        optimizer = torch.optim.AdamW(
-            optim_groups, lr=learning_rate, betas=betas, eps=1e-8, fused=use_fused
+        self.optimizer_muon = muon_class(
+            muon_parameters,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+            momentum=muon_momentum,
+            adjust_lr_fn="match_rms_adamw",
         )
-
-        self.optimizer = optimizer
+        self.optimizer_adamw = torch.optim.AdamW(
+            [
+                {"params": adamw_decay, "weight_decay": weight_decay},
+                {"params": adamw_no_decay, "weight_decay": 0.0},
+            ],
+            lr=learning_rate,
+            betas=betas,
+            eps=1e-8,
+            fused=use_fused,
+        )
+        self.optimizer = self.optimizer_muon
 
     def optimizer_step(
         self,
@@ -494,25 +546,32 @@ class GPT(ModelBase):
         If gradient clipping is enabled, return the gradient norm before clipping.
         """
         self._assert_fabric_is_setup()
-        assert (
-            self.optimizer is not None
-        ), "Optimizer must be set up before calling this function"
+        if self.optimizer_muon is None or self.optimizer_adamw is None:
+            raise RuntimeError("Optimizers must be set up before calling this function")
 
         # Update learning rate
         if learning_rate is not None:
-            for param_group in self.optimizer.param_groups:
-                param_group["lr"] = learning_rate
+            for optimizer in (self.optimizer_muon, self.optimizer_adamw):
+                for param_group in optimizer.param_groups:
+                    param_group["lr"] = learning_rate
 
         # Clip gradient
         grad_norm = None
         if grad_clip is not None:
-            grad_norm = self.fabric.clip_gradients(
-                self.model, self.optimizer, max_norm=grad_clip
-            )
+            group_norms = []
+            for optimizer in (self.optimizer_muon, self.optimizer_adamw):
+                group_norm = self.fabric.clip_gradients(
+                    self.model, optimizer, max_norm=grad_clip
+                )
+                if group_norm is not None:
+                    group_norms.append(group_norm)
+            if group_norms:
+                grad_norm = torch.linalg.vector_norm(torch.stack(group_norms))
 
         # Step optimizer
-        self.optimizer.step()
-        self.optimizer.zero_grad(set_to_none=True)
+        for optimizer in (self.optimizer_muon, self.optimizer_adamw):
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
         self.training_steps += 1
 
         # Return gradient norm
@@ -546,18 +605,21 @@ class GPT(ModelBase):
         """
         Get the state of the model for checkpoint save/load
         """
-        return {
+        state: Dict[str, Any] = {
             "model": self.model,
-            "optimizer": self.optimizer,
             "training_steps": self.training_steps,
         }
+        if self.optimizer_muon is not None and self.optimizer_adamw is not None:
+            state["optimizer_muon"] = self.optimizer_muon
+            state["optimizer_adamw"] = self.optimizer_adamw
+        return state
 
     @classmethod
     def from_pretrained(cls, model_type: str, override_args: Optional[dict] = None):
         assert model_type in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
         override_args = override_args or {}  # default to empty dict
-        # only dropout can be overridden see more notes below
-        assert all(k == "dropout" for k in override_args)
+        # only dropout and dtype can be overridden
+        assert all(k in {"dropout", "dtype"} for k in override_args)
         from transformers import GPT2LMHeadModel
 
         print("loading weights from pretrained gpt: %s" % model_type)
@@ -577,6 +639,8 @@ class GPT(ModelBase):
         if "dropout" in override_args:
             print(f"overriding dropout rate to {override_args['dropout']}")
             config_args["dropout"] = override_args["dropout"]
+        if "dtype" in override_args:
+            config_args["dtype"] = override_args["dtype"]
         # create a from-scratch initialized minGPT model
         config = GPTConfig(**config_args)
         gpt = GPT(config)

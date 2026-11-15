@@ -9,12 +9,15 @@ source ~/venv/bin/activate
 
 Data preparation:
 > python data/stargraph/prepare.py --num_samples 1000000 --num_paths 5 --path_length 5 --max_nodes 50
+> python data/stargraph/prepare.py --num_samples 1000000 --num_paths 5 --path_length 5 --max_nodes 50 --general_tree True
+
 Baseline:
 > python train.py --config config/gpt_stargraph_mini.yaml data.stargraph_data_path="data/stargraph/graph_5_5_sample_10000000.txt"
 Belief State Transformer:
 > python train.py --config config/bst_stargraph_mini.yaml data.stargraph_data_path="data/stargraph/graph_5_5_sample_1000000.txt"
 Feature RNN:
 > python train.py --config config/feature_rnn_stargraph_mini.yaml data.stargraph_data_path="data/stargraph/graph_5_5_sample_1000000.txt"
+> python train.py --config config/feature_rnn_stargraph_mini.yaml data.stargraph_data_path="data/stargraph/graph_5_5_sample_1000000_general_tree.txt"
 
 # Stargraph - visualize
 

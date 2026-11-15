@@ -46,6 +46,7 @@ class ModelBase:
         learning_rate: float,
         betas: Tuple[float, float],
         use_fused: Optional[bool] = None,
+        muon_momentum: float = 0.95,
     ):
         """Create optimizer for training the model"""
         raise NotImplementedError
@@ -274,7 +275,13 @@ class FusedCrossEntropyLoss:
 
 
 class RotaryPositionEmbedding:
-    def __init__(self, max_seq_len: int, head_dim: int, base_freq: float = 10000):
+    def __init__(
+        self,
+        max_seq_len: int,
+        head_dim: int,
+        base_freq: float = 10000,
+        dtype: torch.dtype = torch.float32,
+    ):
         assert head_dim % 2 == 0, "Dimension of attention head must be even"
         # round max_seq_len up to next multiple of 256
         self.max_seq_len = (max_seq_len + 255) // 256 * 256
@@ -282,6 +289,7 @@ class RotaryPositionEmbedding:
         self.base_freq = base_freq
         self.cos_lookup = None
         self.sin_lookup = None
+        self.dtype = dtype
 
     @torch.no_grad()
     def __call__(self, pos: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -303,7 +311,10 @@ class RotaryPositionEmbedding:
             self.cos_lookup = self.cos_lookup.to(pos.device)
             self.sin_lookup = self.sin_lookup.to(pos.device)
 
-        return self.cos_lookup[pos], self.sin_lookup[pos]
+        return (
+            self.cos_lookup[pos].to(dtype=self.dtype),
+            self.sin_lookup[pos].to(dtype=self.dtype),
+        )
 
     def _precompute_cos_sin(self, device: torch.device):
         # Always use full precision for precomputation
@@ -405,9 +416,10 @@ class SwiGLU(nn.Module):
         input_size: int,
         output_size: int,
         bias: bool = False,
+        dtype: torch.dtype = torch.float32
     ):
         super().__init__()
-        self.gate_up = nn.Linear(input_size, 2 * output_size, bias=bias)
+        self.gate_up = nn.Linear(input_size, 2 * output_size, bias=bias, dtype=dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Split the linear layer output into two chunks

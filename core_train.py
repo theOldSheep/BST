@@ -45,6 +45,22 @@ def initialize_model(
 ):
     fabric.print(f"Initializing model with config: {config}")
 
+    model_dtype_name = config.model.get("dtype", "float16")
+    model_dtypes = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }
+    if (
+        not isinstance(model_dtype_name, str)
+        or model_dtype_name not in model_dtypes
+    ):
+        raise ValueError(
+            "model.dtype must be one of "
+            f"{', '.join(model_dtypes)}, got {model_dtype_name!r}"
+        )
+    model_dtype = model_dtypes[model_dtype_name]
+
     if config.use_bst:
         ModelClass = BST
         ModelConfigClass = BSTConfig
@@ -77,6 +93,7 @@ def initialize_model(
         bias=config.model.bias,
         vocab_size=config.model.vocab_size,
         dropout=config.model.dropout,
+        dtype=model_dtype,
         eos_token_id=tokenizer.eos_token_id,
         use_fused=config.trainer.use_fused_kernels,
     )
@@ -111,9 +128,6 @@ def initialize_model(
                 "feature_selection_backward_distance",
                 feature_defaults.feature_selection_backward_distance,
             ),
-            muon_momentum=config.model.get(
-                "muon_momentum", feature_defaults.muon_momentum
-            ),
             rope_enabled_for_inference=config.model.get(
                 "rope_enabled_for_inference",
                 feature_defaults.rope_enabled_for_inference,
@@ -130,6 +144,16 @@ def initialize_model(
             ),
             n_model_split_v=config.model.get(
                 "n_model_split_v", feature_defaults.n_model_split_v
+            ),
+            omit_u_matrix=config.model.get(
+                "omit_u_matrix", feature_defaults.omit_u_matrix
+            ),
+            omit_v_matrix=config.model.get(
+                "omit_v_matrix", feature_defaults.omit_v_matrix
+            ),
+            orthogonal_regularization_factor=config.model.get(
+                "orthogonal_regularization_factor",
+                feature_defaults.orthogonal_regularization_factor,
             ),
         )
     else:
@@ -203,7 +227,7 @@ def initialize_model(
         assert not config.use_bst, "BST not supported with GPT-2 weights"
         if config.model.architecture != "gpt":
             raise ValueError("OpenAI GPT-2 initialization is only supported for GPT")
-        override_args = dict(dropout=config.model.dropout)
+        override_args = dict(dropout=config.model.dropout, dtype=model_dtype)
         model = ModelClass.from_pretrained(config.trainer.init_from, override_args)
         # read off the created config params, so we can store them into checkpoint correctly
         for k in ["n_layer", "n_head", "n_embd", "block_size", "bias", "vocab_size"]:
@@ -249,6 +273,7 @@ def initialize_model(
             learning_rate=config.optimizer.learning_rate,
             betas=(config.optimizer.beta1, config.optimizer.beta2),
             use_fused=use_fused,
+            muon_momentum=config.optimizer.get("muon_momentum", 0.95),
         )
 
     # Setup model and optimizer

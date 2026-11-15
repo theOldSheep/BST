@@ -39,6 +39,7 @@ class FeatureRNNConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 384
+    dtype: torch.dtype = torch.float16
     dropout: float = 0.0
     bias: bool = False
     context_length: int = 0
@@ -46,12 +47,14 @@ class FeatureRNNConfig:
     feature_selection_layers: int = 4
     feature_selection_heads: int = 4
     feature_selection_backward_distance: int = 7
-    muon_momentum: float = 0.95
     rope_enabled_for_inference: bool = True
     recurrent_inference: bool = False
     n_fixed_feature_embeddings: int = 16
     n_model_split_u: int = 64
     n_model_split_v: int = 4
+    omit_u_matrix: bool = False
+    omit_v_matrix: bool = False
+    orthogonal_regularization_factor: float = 0.0
 
 class VanillaSelfAttention(nn.Module):
     def __init__(self, config: FeatureRNNConfig, n_head: Optional[int] = None):
@@ -59,9 +62,13 @@ class VanillaSelfAttention(nn.Module):
         self.n_head = n_head if n_head else config.n_head
         assert config.n_embd % self.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = nn.Linear(
+            config.n_embd, 3 * config.n_embd, bias=config.bias, dtype=config.dtype
+        )
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(
+            config.n_embd, config.n_embd, bias=config.bias, dtype=config.dtype
+        )
         # regularization
         self.attn_dropout = (
             nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
@@ -70,6 +77,7 @@ class VanillaSelfAttention(nn.Module):
             nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
         )
         self.n_embd = config.n_embd
+        self.dtype = config.dtype
         self.dropout = config.dropout
         # PyTorch SDPA selects an available fused backend when supported.
         self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
@@ -106,6 +114,8 @@ class VanillaSelfAttention(nn.Module):
         # apply rotary position embedding to q and k
         if rope is not None:
             q, k = RotaryPositionEmbedding.apply(q, k, rope)
+            q = q.to(dtype=self.dtype)
+            k = k.to(dtype=self.dtype)
 
         # causal self-attention; Self-attend: (B, Nh, T, Dh) x (B, Nh, Dh, T) -> (B, Nh, T, T)
         if self.flash:
@@ -142,8 +152,12 @@ class MLP(nn.Module):
         super().__init__()
         hidden_dim = 8 * config.n_embd / 3
         hidden_dim = 128 * round(hidden_dim / 128)
-        self.up = SwiGLU(config.n_embd, hidden_dim, bias=config.bias)
-        self.down = nn.Linear(hidden_dim, config.n_embd, bias=config.bias)
+        self.up = SwiGLU(
+            config.n_embd, hidden_dim, bias=config.bias, dtype=config.dtype
+        )
+        self.down = nn.Linear(
+            hidden_dim, config.n_embd, bias=config.bias, dtype=config.dtype
+        )
         self.dropout = (
             nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
         )
@@ -190,6 +204,9 @@ class FeatureAttention(nn.Module):
         n_fixed_feature_embeddings: int,
         n_model_split_u: int,
         n_model_split_v: int,
+        omit_u_matrix: bool,
+        omit_v_matrix: bool,
+        dtype: torch.dtype,
     ):
         super().__init__()
         if n_embd % n_head != 0:
@@ -197,34 +214,70 @@ class FeatureAttention(nn.Module):
 
         self.n_head = n_head
         self.head_dim = n_embd // n_head
+        self.sqrt_head_dim = math.sqrt(self.head_dim)
+        self.sqrt_two_head_dim = math.sqrt(2 * self.head_dim)
         self.n_embd = n_embd
         self.n_fixed_feature_embeddings = n_fixed_feature_embeddings
         self.n_model_split_u = n_model_split_u
         self.n_model_split_v = n_model_split_v
+        self.omit_u_matrix = omit_u_matrix
+        self.omit_v_matrix = omit_v_matrix
+        self.dtype = dtype
 
         self.fixed_features = nn.Parameter(
-            torch.empty(1, n_fixed_feature_embeddings, n_embd)
+            torch.empty(1, n_fixed_feature_embeddings, n_embd, dtype=dtype)
         )
 
-        self.intent = nn.Linear(n_embd, n_embd, bias=bias)
-        self.feature = nn.Linear(n_embd, n_embd, bias=bias)
+        self.intent = nn.Linear(n_embd, n_embd, bias=bias, dtype=dtype)
+        self.feature = nn.Linear(n_embd, n_embd, bias=bias, dtype=dtype)
         # Need to declare them as 2D to allow Muon to pick them up as params
-        self.op_u = nn.Parameter(
-            torch.empty(n_head * self.head_dim, n_model_split_u)
+        self.op_u = (
+            nn.Parameter(
+                torch.empty(n_head * self.head_dim, n_model_split_u, dtype=dtype)
+            )
+            if not omit_u_matrix
+            else None
         )
-        self.op_v = nn.Parameter(
-            torch.empty(n_head * n_model_split_v, self.head_dim)
+        self.op_v = (
+            nn.Parameter(
+                torch.empty(n_head * n_model_split_v, self.head_dim, dtype=dtype)
+            )
+            if not omit_v_matrix
+            else None
         )
-        self.output_proj = nn.Linear(n_embd, n_embd, bias=bias)
+        # TODO - test component performance impact
+        self.output_proj = nn.Linear(n_embd, n_embd, bias=bias, dtype=dtype)
         self.dropout = dropout
         self.resid_dropout = (
             nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         )
         nn.init.normal_(self.fixed_features, mean=0.0, std=0.02)
-        nn.init.normal_(self.op_u, mean=0.0, std=0.02)
-        nn.init.normal_(self.op_v, mean=0.0, std=0.02)
+        if self.op_u is not None:
+            nn.init.normal_(self.op_u, mean=0.0, std=1.0/math.sqrt(n_model_split_u))
+        if self.op_v is not None:
+            nn.init.normal_(self.op_v, mean=0.0, std=1.0/math.sqrt(n_model_split_v))
         self.debug_name = "feature_attention"
         self._debug_gradient_reported = False
+
+    def orthogonal_regularization_loss(self) -> torch.Tensor:
+        loss = self.fixed_features.new_zeros(())
+        if self.op_u is not None:
+            u = self.op_u.reshape(
+                self.n_head, self.head_dim, self.n_model_split_u
+            ).float()
+            identity_u = torch.eye(
+                self.n_model_split_u, device=u.device, dtype=u.dtype
+            )
+            loss = loss + (u.transpose(-1, -2) @ u - identity_u).square().mean()
+        if self.op_v is not None:
+            v = self.op_v.reshape(
+                self.n_head, self.n_model_split_v, self.head_dim
+            ).float()
+            identity_v = torch.eye(
+                self.n_model_split_v, device=v.device, dtype=v.dtype
+            )
+            loss = loss + (v @ v.transpose(-1, -2) - identity_v).square().mean()
+        return loss
 
     def _debug_tensor(
         self,
@@ -262,7 +315,7 @@ class FeatureAttention(nn.Module):
         rope: Optional[Tuple[torch.Tensor, torch.Tensor]],
     ) -> torch.Tensor:
         batch_size, seq_len, _ = x.size()
-        broadcasted_fixed_features = self.fixed_features.repeat((batch_size, 1, 1))
+        broadcasted_fixed_features = self.fixed_features.expand(batch_size, -1, -1)
         x = torch.concat( (broadcasted_fixed_features, x), dim=1 )
         seq_len += self.n_fixed_feature_embeddings
 
@@ -277,23 +330,33 @@ class FeatureAttention(nn.Module):
             intent, features = RotaryPositionEmbedding.apply(
                 intent, features, rope
             )
+            intent = intent.to(dtype=self.dtype)
+            features = features.to(dtype=self.dtype)
 
         # Since we have U >= V, muliplying U first is more efficient than multiplying V first.
         reshaped_e = x.reshape(
             batch_size, seq_len, self.n_model_split_u, self.n_model_split_v
         )
-        reshaped_u = self.op_u.reshape(
-            self.n_head, self.head_dim, self.n_model_split_u
-        )
-        reshaped_v = self.op_v.reshape(
-            self.n_head, self.n_model_split_v, self.head_dim
-        )
-        ue = (
-            torch.einsum("hiu,bkuv->bkhiv", reshaped_u, reshaped_e)
-        )
-        operations = torch.einsum("bkhiv,hvj->bkhij", ue, reshaped_v)
+        # If ommitting u/v, they will be effectively identity matrix.
+        if self.op_u is None:
+            ue = reshaped_e.unsqueeze(2).expand(
+                -1, -1, self.n_head, -1, -1
+            )
+        else:
+            reshaped_u = self.op_u.reshape(
+                self.n_head, self.head_dim, self.n_model_split_u
+            )
+            ue = torch.einsum("hiu,bkuv->bkhiv", reshaped_u, reshaped_e)
+        if self.op_v is None:
+            operations = ue
+        else:
+            reshaped_v = self.op_v.reshape(
+                self.n_head, self.n_model_split_v, self.head_dim
+            )
+            operations = torch.einsum("bkhiv,hvj->bkhij", ue, reshaped_v)
         # batch, head, seq, head_dim, head_dim
-        operations = operations.permute(0, 2, 1, 3, 4).contiguous()
+        # Each position is sum of head_dim components - variance scale back
+        operations = operations.permute(0, 2, 1, 3, 4).contiguous() / self.sqrt_head_dim
 
         if mask.ndim != 2 or mask.shape != (seq_len, seq_len):
             raise ValueError(
@@ -303,39 +366,51 @@ class FeatureAttention(nn.Module):
 
         # calculated[bhij_] = matmul(operation_i, feature_j)
         # operation: bh[i/j]_ _, feature: bh[i/j]_
-        calculated = torch.einsum('bhimn,bhjn->bhijm', operations, features)
+        calculated = torch.einsum('bhimn,bhjm->bhijn', operations, features)
         # print(operations.shape)
         # print(features.shape)
         # print(calculated.shape)
 
         # Sadly, our attn depends on both i and j - flash attention not applicable...
-        scale = math.sqrt(self.head_dim)
-        scores_fwd = torch.einsum('bhim,bhijm->bhij', intent, calculated) / scale
-        scores_back = torch.einsum('bhim,bhjim->bhij', intent, calculated) / scale
+        scores_fwd = torch.einsum('bhim,bhijm->bhij', intent, calculated)
+        scores_back = torch.einsum('bhim,bhjim->bhij', intent, calculated)
+        # scores_raw = torch.einsum('bhim,bhjm->bhij', intent, features)
         # Mask out the not-allowed attention positions
         scores_fwd = scores_fwd.masked_fill(~mask[None, None, :, :], float('-inf'))
         scores_back = scores_back.masked_fill(~mask[None, None, :, :], float('-inf'))
-        scores = torch.concat((scores_fwd, scores_back), dim=-1)
-        # If row fully masked out, need to fill with zero score to prevent -inf mess up grad
-        has_visible_keys = mask.any(dim=-1)[None, None, :, None]
-        scores = torch.where(has_visible_keys, scores, torch.zeros_like(scores))
+        scores = torch.concat((scores_fwd, scores_back), dim=-1) / self.sqrt_two_head_dim
         # print(f"score_fwd: \n{scores_fwd}")
         # print(f"score_b: \n{scores_back}")
         # print(f"score: \n{scores}")
         # Softmax and sum over "j" overall
         attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = attn_weights.masked_fill(~has_visible_keys, 0.0)
         # Revisit fwd & back to yield the attention result; batch, head, idx, head_dim
         attn =  torch.einsum('bhij,bhijm->bhim', attn_weights[:,:,:,:seq_len], calculated) + \
-                torch.einsum('bhij,bhjim->bhim', attn_weights[:,:,:,seq_len:], calculated)
+                torch.einsum('bhij,bhjim->bhim', attn_weights[:,:,:,seq_len:seq_len*2], calculated)
         # print(f"attn_w: \n{attn_weights}")
         # print(f"attn: \n{attn}")
 
         output = attn.transpose(1, 2).reshape(
             batch_size, seq_len, self.n_embd)
-        output = self.resid_dropout(self.output_proj(output))[
+        output = self.output_proj(output)
+        output = self.resid_dropout(output)[
             :, self.n_fixed_feature_embeddings:, :
         ]
+
+        # if torch.rand((1,1))[0,0] < 0.01:
+        #     reshaped_u = self.op_u.reshape(
+        #         self.n_head, self.head_dim, self.n_model_split_u
+        #     )
+        #     reshaped_v = self.op_v.reshape(
+        #         self.n_head, self.n_model_split_v, self.head_dim
+        #     )
+        #     print("Sampled UTU:")
+        #     for i in range(self.n_head):
+        #         print(reshaped_u[i,:,:].transpose(0, 1) @ reshaped_u[i,:,:])
+        #     print("Sampled VVT:")
+        #     for i in range(self.n_head):
+        #         print(reshaped_v[i,:,:] @ reshaped_v[i,:,:].transpose(0, 1))
+
         if (
             FEATURE_RNN_DEBUG_GRADIENTS
             and self.training
@@ -349,7 +424,8 @@ class FeatureAttention(nn.Module):
                 ("u", self.op_u),
                 ("v", self.op_v),
             ):
-                self._debug_tensor(name, tensor)
+                if tensor is not None:
+                    self._debug_tensor(name, tensor)
             self._debug_gradient_reported = True
         return output
 
@@ -370,7 +446,11 @@ class FeatureRNNBlock(nn.Module):
             config.n_fixed_feature_embeddings,
             config.n_model_split_u,
             config.n_model_split_v,
+            config.omit_u_matrix,
+            config.omit_v_matrix,
+            config.dtype,
         )
+        # TODO - test component performance impact
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
@@ -385,7 +465,8 @@ class FeatureRNNBlock(nn.Module):
             mask=mask,
             rope=rope,
         )
-        return x + self.mlp(self.ln_2(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
 
 
 class FeatureRNNTransformer(FusedCrossEntropyLoss, nn.Module):
@@ -405,34 +486,49 @@ class FeatureRNNTransformer(FusedCrossEntropyLoss, nn.Module):
                 f"got {config.n_model_split_u} * {config.n_model_split_v} != {config.n_embd}"
             )
         if config.n_model_split_u < config.n_model_split_v:
-            raise ValueError(
-                "n_model_split_u must be no less than n_model_split_v for efficient multiplication, "
-                "swap them to pass this validation."
+            print("n_model_split_u is less than n_model_split_v. \
+                  Unless this is arbitrary choice by omitting U or V, \
+                  consider swapping them for slightly more efficient multiplication."
             )
-        if config.feature_selection_heads < 0:
-            raise ValueError("feature_selection_heads must be non-negative")
+        if config.n_head < 1:
+            raise ValueError("n_head must be positive")
+        if config.n_embd % config.n_head != 0:
+            raise ValueError("n_embd must be divisible by n_head")
+        head_dim = config.n_embd // config.n_head
+        if config.omit_u_matrix and config.n_model_split_u != head_dim:
+            raise ValueError(
+                "n_model_split_u must be equal to attn head dimension when omit_u_matrix is on"
+            )
+        if config.omit_v_matrix and config.n_model_split_v != head_dim:
+            raise ValueError(
+                "n_model_split_v must be equal to attn head dimension when omit_v_matrix is on"
+            )
+        if config.feature_selection_heads < 1:
+            raise ValueError("feature_selection_heads must be positive")
         if config.feature_selection_backward_distance < 0:
             raise ValueError(
                 "feature_selection_backward_distance must be non-negative"
             )
         if config.n_fixed_feature_embeddings < 0:
             raise ValueError("n_fixed_feature_embeddings must be non-negative")
-        if config.n_embd % config.n_head != 0:
-            raise ValueError("n_embd must be divisible by n_head")
         if config.n_embd % config.feature_selection_heads != 0:
             raise ValueError(
                 "n_embd must be divisible by feature_selection_heads"
             )
 
         self.config = config
-        self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
+        self.token_embedding = nn.Embedding(
+            config.vocab_size, config.n_embd, dtype=config.dtype
+        )
         self.feature_rotary_embedding = RotaryPositionEmbedding(
             max_seq_len=config.block_size,
             head_dim=config.n_embd // config.feature_selection_heads,
+            dtype=config.dtype,
         )
         self.inference_rotary_embedding = RotaryPositionEmbedding(
             max_seq_len=config.block_size + config.n_fixed_feature_embeddings,
             head_dim=config.n_embd // config.n_head,
+            dtype=config.dtype,
         )
         # If not recurrent, don't init it at all - otherwise Muon will think it's in use
         shared_recurrent_block = (
@@ -463,7 +559,9 @@ class FeatureRNNTransformer(FusedCrossEntropyLoss, nn.Module):
                 norm=LayerNorm(config.n_embd, bias=config.bias),
             )
         )
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(
+            config.n_embd, config.vocab_size, bias=False, dtype=config.dtype
+        )
 
         self.apply(self._init_weights)
         for name, module in self.named_modules():
@@ -485,6 +583,13 @@ class FeatureRNNTransformer(FusedCrossEntropyLoss, nn.Module):
             n_params -= self.token_embedding.weight.numel()
         return n_params
 
+    def orthogonal_regularization_loss(self) -> torch.Tensor:
+        loss = self.lm_head.weight.new_zeros(())
+        for module in self.modules():
+            if isinstance(module, FeatureAttention):
+                loss = loss + module.orthogonal_regularization_loss()
+        return loss
+
     def _feature_selection_mask(
         self, seq_len: int, device: torch.device
     ) -> torch.Tensor:
@@ -497,7 +602,7 @@ class FeatureRNNTransformer(FusedCrossEntropyLoss, nn.Module):
     def _recurrent_mask(
         self, seq_len: int, device: torch.device
     ) -> torch.Tensor:
-        aug_to_aug = torch.zeros(
+        aug_to_aug = torch.eye(
             self.config.n_fixed_feature_embeddings,
             self.config.n_fixed_feature_embeddings,
             dtype=torch.bool,
@@ -570,21 +675,26 @@ class FeatureRNNTransformer(FusedCrossEntropyLoss, nn.Module):
 
         if targets is None:
             return self.lm_head(x)
+        loss = self.cross_entropy_loss(x, self.lm_head, targets)
+        if self.config.orthogonal_regularization_factor > 0:
+            loss = loss + (
+                self.config.orthogonal_regularization_factor
+                * self.orthogonal_regularization_loss()
+            )
         if return_accuracy:
-            loss = self.cross_entropy_loss(x, self.lm_head, targets)
             with torch.no_grad():
                 logits = self.lm_head(x.reshape(-1, x.size(-1)))
                 accuracy = logits.argmax(dim=-1).reshape_as(targets) == targets
                 accuracy.masked_fill_(targets == -100, False)
             return loss, accuracy
-        return self.cross_entropy_loss(x, self.lm_head, targets)
+        return loss
 
 
 class FeatureRNN(ModelBase):
     def __init__(self, config: FeatureRNNConfig):
         super().__init__()
         self.config = config
-        self.model = FeatureRNNTransformer(config)
+        self.model = FeatureRNNTransformer(config).to(dtype=config.dtype)
         self._pair_accuracy_counts = None
         self._pair_accuracy_correct = None
         self.optimizer_muon: Optional[torch.optim.Optimizer] = None
@@ -617,9 +727,8 @@ class FeatureRNN(ModelBase):
         del _kwargs
         inputs = batch[:, :-1]
         targets = batch[:, 1:]
-        # Based on experiment, masking out prediction on prefix hinders convergence
-        # Although edge token prediction introduces token-wise entropy from randomness and permutation
-        # Prediction on edges seems to augment gradient & allow model to learn the question better
+        # Unlike baseline GPT models, feature attention only sees marginal gains by including prefix
+        # Isn't woth the extra effort to predict entropy-heavy prefix
         # if not 0 <= self.config.context_length < targets.size(1):
         #     raise ValueError(
         #         f"context_length must be in [0, {targets.size(1) - 1}], "
@@ -697,6 +806,7 @@ class FeatureRNN(ModelBase):
         learning_rate: float,
         betas: Tuple[float, float],
         use_fused: Optional[bool] = None,
+        muon_momentum: float = 0.95,
     ):
         muon_class = getattr(torch.optim, "Muon", None)
         if muon_class is None:
@@ -752,19 +862,17 @@ class FeatureRNN(ModelBase):
                 "Muon and AdamW parameter groups must cover every trainable "
                 "parameter exactly once"
             )
-        if not muon_parameters:
-            raise ValueError("FeatureRNN has no 2D hidden-layer parameters for Muon")
-        print(f"Muon parameter names: {[name for name, _ in muon_named_parameters]}")
-        print(
-            "AdamW-only parameter names: "
-            f"{[name for name, parameter in named_parameters if id(parameter) not in muon_parameter_ids]}"
-        )
+        # print(f"Muon parameter names: {[name for name, _ in muon_named_parameters]}")
+        # print(
+        #     "AdamW-only parameter names: "
+        #     f"{[name for name, parameter in named_parameters if id(parameter) not in muon_parameter_ids]}"
+        # )
 
         self.optimizer_muon = muon_class(
             muon_parameters,
             lr=learning_rate,
             weight_decay=weight_decay,
-            momentum=self.config.muon_momentum,
+            momentum=muon_momentum,
             adjust_lr_fn="match_rms_adamw",
         )
         self.optimizer_adamw = torch.optim.AdamW(

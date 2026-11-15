@@ -16,7 +16,7 @@ trainer:
 
 data:
   dataset: stargraph
-  effective_batch_size: 512
+  effective_batch_size: 60
   gradient_accum_steps: 1
   pair_accum_steps: 1
   goal_range: [25, 75]
@@ -26,7 +26,7 @@ data:
 
 model:
   n_layer: 8
-  n_head: 4
+  n_head: 8
   n_embd: 256
   dropout: 0.0
   bias: false
@@ -37,8 +37,8 @@ model:
   bst_pair_minimum_gap: 2
 
 optimizer:
-  learning_rate: 1e-4 #without bst's grad augmentation, lower lr & larger batch size
-  weight_decay: 0.0
+  learning_rate: 3e-4 #without bst's grad augmentation, lower lr & larger batch size
+  weight_decay: 0.0001
   beta1: 0.9
   beta2: 0.95
   grad_clip: null
