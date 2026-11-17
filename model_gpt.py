@@ -485,23 +485,32 @@ class GPT(ModelBase):
             if parameter.requires_grad
         ]
         # print([name for name, _ in named_parameters])
+        # TODO - replication
         muon_named_parameters = [
-            (name, parameter)
-            for name, parameter in named_parameters
-            if parameter.ndim == 2
-            and not name.endswith("token_embedding.weight")
-            and not name.endswith("lm_head.weight")
+            # (name, parameter)
+            # for name, parameter in named_parameters
+            # if parameter.ndim == 2
+            # and not name.endswith("token_embedding.weight")
+            # and not name.endswith("lm_head.weight")
         ]
         # print([name for name, _ in muon_named_parameters])
         muon_parameters = [parameter for _, parameter in muon_named_parameters]
         muon_parameter_ids = {id(parameter) for parameter in muon_parameters}
         adamw_decay = [
             parameter
-            for _, parameter in named_parameters
-            if parameter.ndim >= 2 and id(parameter) not in muon_parameter_ids
+            for name, parameter in named_parameters
+            if parameter.ndim >= 2
+            and not name.endswith("token_embedding.weight")
+            and not name.endswith("lm_head.weight")
+            and id(parameter) not in muon_parameter_ids
         ]
         adamw_no_decay = [
-            parameter for _, parameter in named_parameters if parameter.ndim < 2
+            parameter 
+            for name, parameter in named_parameters
+            if parameter.ndim < 2
+            or name.endswith("token_embedding.weight")
+            or name.endswith("lm_head.weight")
+            and id(parameter) not in muon_parameter_ids
         ]
         optimizer_parameter_ids = [
             id(parameter)
@@ -517,13 +526,17 @@ class GPT(ModelBase):
                 "parameter exactly once"
             )
 
-        self.optimizer_muon = muon_class(
-            muon_parameters,
-            lr=learning_rate,
-            weight_decay=weight_decay,
-            momentum=muon_momentum,
-            adjust_lr_fn="match_rms_adamw",
-        )
+        if muon_parameters:
+            self.optimizer_muon = muon_class(
+                muon_parameters,
+                lr=learning_rate,
+                weight_decay=weight_decay,
+                momentum=muon_momentum,
+                adjust_lr_fn="match_rms_adamw",
+            )
+        else:
+            self.optimizer_muon = None
+            print("BST Model is not using Muon optimizer.")
         self.optimizer_adamw = torch.optim.AdamW(
             [
                 {"params": adamw_decay, "weight_decay": weight_decay},
@@ -534,7 +547,7 @@ class GPT(ModelBase):
             eps=1e-8,
             fused=use_fused,
         )
-        self.optimizer = self.optimizer_muon
+        self.optimizer = self.optimizer_muon if self.optimizer_muon is not None else self.optimizer_adamw
 
     def optimizer_step(
         self,
@@ -546,32 +559,41 @@ class GPT(ModelBase):
         If gradient clipping is enabled, return the gradient norm before clipping.
         """
         self._assert_fabric_is_setup()
-        if self.optimizer_muon is None or self.optimizer_adamw is None:
-            raise RuntimeError("Optimizers must be set up before calling this function")
 
         # Update learning rate
         if learning_rate is not None:
             for optimizer in (self.optimizer_muon, self.optimizer_adamw):
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = learning_rate
+                if optimizer is not None:
+                    for param_group in optimizer.param_groups:
+                        param_group["lr"] = learning_rate
 
         # Clip gradient
         grad_norm = None
         if grad_clip is not None:
             group_norms = []
             for optimizer in (self.optimizer_muon, self.optimizer_adamw):
-                group_norm = self.fabric.clip_gradients(
-                    self.model, optimizer, max_norm=grad_clip
-                )
-                if group_norm is not None:
-                    group_norms.append(group_norm)
+                if optimizer is not None:
+                    encoder_grad_norm = self.fabric.clip_gradients(
+                        self.encoder, optimizer, max_norm=grad_clip
+                    )
+                    texthead_grad_norm = self.fabric.clip_gradients(
+                        self.text_head, optimizer, max_norm=grad_clip
+                    )
+                    group_norms.extend(
+                        norm
+                        for norm in (encoder_grad_norm, texthead_grad_norm)
+                        if norm is not None
+                    )
             if group_norms:
                 grad_norm = torch.linalg.vector_norm(torch.stack(group_norms))
 
         # Step optimizer
         for optimizer in (self.optimizer_muon, self.optimizer_adamw):
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            if optimizer is not None:
+                optimizer.step()
+        for optimizer in (self.optimizer_muon, self.optimizer_adamw):
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
         self.training_steps += 1
 
         # Return gradient norm

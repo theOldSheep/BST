@@ -47,4 +47,4 @@ lr_scheduler:
   decay_lr: false
   warmup_iters: 100
   lr_decay_iters: 600000
-  min_lr: 0.0002
+  min_lr: 0.0001

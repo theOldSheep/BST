@@ -1,7 +1,7 @@
 use_bst: true
 
 trainer:
-  train_batches: 6000
+  train_batches: 20000
   val_batches: 200
   val_only: false
   log_interval: 1
@@ -26,7 +26,7 @@ data:
 model:
   dtype: float32
   n_layer: 8
-  n_head: 8
+  n_head: 4
   n_embd: 256
   dropout: 0.0
   bias: false
@@ -38,7 +38,7 @@ model:
 
 optimizer:
   learning_rate: 3e-4
-  weight_decay: 0.0
+  weight_decay: 0.1
   beta1: 0.9
   beta2: 0.95
   grad_clip: null
@@ -47,4 +47,4 @@ lr_scheduler:
   decay_lr: false
   warmup_iters: 100
   lr_decay_iters: 600000
-  min_lr: 0.0002
+  min_lr: 1e-5

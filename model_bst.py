@@ -147,17 +147,23 @@ class TextHead(FusedCrossEntropyLoss, nn.Module):
     def _cross_entropy_loss_with_accuracy(
         self, input: torch.Tensor, targets: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert self.config is not None, "Expected super-class to set self.config"
+
         input_flat = input.reshape(-1, input.size(-1))
         targets_flat = targets.reshape(-1)
+        assert input_flat.size(0) == targets_flat.size(
+            0
+        ), f"Flattened input and target shapes do not match: {input_flat.shape} vs {targets_flat.shape}"
 
         if self.config.use_fused:
-            loss = self.cross_entropy_loss(input, self.lm_head, targets)
+            loss = self.cross_entropy_loss(input_flat, self.lm_head, targets_flat)
             with torch.no_grad():
                 accuracy = self.lm_head(input_flat).argmax(dim=-1) == targets_flat
         else:
             logits = self.lm_head(input_flat)
             loss = F.cross_entropy(logits, targets_flat)
-            accuracy = logits.detach().argmax(dim=-1) == targets_flat
+            with torch.no_grad():
+                accuracy = logits.detach().argmax(dim=-1) == targets_flat
 
         return loss, accuracy.reshape(targets.shape)
 
@@ -913,11 +919,11 @@ class BST(ModelBase):
         ]
         # print([name for name, _ in named_parameters])
         muon_named_parameters = [
-            (name, parameter)
-            for name, parameter in named_parameters
-            if parameter.ndim == 2
-            and not name.endswith("token_embedding.weight")
-            and not name.endswith("lm_head.weight")
+            # (name, parameter)
+            # for name, parameter in named_parameters
+            # if parameter.ndim == 2
+            # and not name.endswith("token_embedding.weight")
+            # and not name.endswith("lm_head.weight")
         ]
         # print([name for name, _ in muon_named_parameters])
         muon_parameters = [parameter for _, parameter in muon_named_parameters]
@@ -1017,6 +1023,8 @@ class BST(ModelBase):
         for optimizer in (self.optimizer_muon, self.optimizer_adamw):
             if optimizer is not None:
                 optimizer.step()
+        for optimizer in (self.optimizer_muon, self.optimizer_adamw):
+            if optimizer is not None:
                 optimizer.zero_grad(set_to_none=True)
         self.training_steps += 1
 

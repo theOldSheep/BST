@@ -21,7 +21,6 @@ from model_feature_rnn import (
     FeatureRNN,
     FeatureRNNConfig,
     FeatureRNNBlock,
-    VanillaAttentionBlock as FeatureRNNVanillaAttentionBlock,
 )
 
 # flaatten the metric json - make the csv more readable with more columns
@@ -309,10 +308,7 @@ def shard_model(
                 submodule,
                 (
                     Block,
-                    BeliefRNNBlock,
-                    BeliefRNNCrossAttentionDecoderBlock,
                     FeatureRNNBlock,
-                    FeatureRNNVanillaAttentionBlock,
                 ),
             ):
                 submodule = fully_shard(

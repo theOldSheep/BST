@@ -103,7 +103,7 @@ class Inference:
         self,
         fabric: L.Fabric,
         config,
-        model: Union[BST, GPT, BeliefRNN, FeatureRNN],
+        model: Union[BST, GPT, FeatureRNN],
         tokenizer,
         top_k: int = None,  # limit sampling to top K next tokens
         add_eos_token: bool = True,  # add EOS token to start of prompt and end of goal

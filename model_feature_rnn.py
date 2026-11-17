@@ -28,8 +28,7 @@ from model_base import (
     SwiGLU,
 )
 
-# Debug flag
-FEATURE_RNN_DEBUG_GRADIENTS = False
+USE_VANILLA_ATTN = True
 
 
 @dataclass
@@ -56,97 +55,6 @@ class FeatureRNNConfig:
     omit_v_matrix: bool = False
     orthogonal_regularization_factor: float = 0.0
 
-class VanillaSelfAttention(nn.Module):
-    def __init__(self, config: FeatureRNNConfig, n_head: Optional[int] = None):
-        super().__init__()
-        self.n_head = n_head if n_head else config.n_head
-        assert config.n_embd % self.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(
-            config.n_embd, 3 * config.n_embd, bias=config.bias, dtype=config.dtype
-        )
-        # output projection
-        self.c_proj = nn.Linear(
-            config.n_embd, config.n_embd, bias=config.bias, dtype=config.dtype
-        )
-        # regularization
-        self.attn_dropout = (
-            nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
-        )
-        self.resid_dropout = (
-            nn.Dropout(config.dropout) if config.dropout > 0 else nn.Identity()
-        )
-        self.n_embd = config.n_embd
-        self.dtype = config.dtype
-        self.dropout = config.dropout
-        # PyTorch SDPA selects an available fused backend when supported.
-        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
-        if not self.flash:
-            print(
-                "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0"
-            )
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer(
-                "bias",
-                torch.tril(torch.ones(config.block_size, config.block_size)).view(
-                    1, 1, config.block_size, config.block_size
-                ),
-            )
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        # input should have shape (batch_size, seq_len, n_embd)
-        B, T, C = x.size()
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-
-        # convert to shape (B, n_head, T, d_head)
-        d_head = C // self.n_head
-        k = k.view(B, T, self.n_head, d_head).transpose(1, 2)
-        q = q.view(B, T, self.n_head, d_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, d_head).transpose(1, 2)
-
-        # apply rotary position embedding to q and k
-        if rope is not None:
-            q, k = RotaryPositionEmbedding.apply(q, k, rope)
-            q = q.to(dtype=self.dtype)
-            k = k.to(dtype=self.dtype)
-
-        # causal self-attention; Self-attend: (B, Nh, T, Dh) x (B, Nh, Dh, T) -> (B, Nh, T, T)
-        if self.flash:
-            # Use PyTorch's fused scaled-dot-product attention backend.
-            if mask is not None:
-                mask = mask.view(1, 1, T, T)
-            y = torch.nn.functional.scaled_dot_product_attention(
-                query=q,
-                key=k,
-                value=v,
-                attn_mask=mask,
-                dropout_p=self.dropout if self.training else 0,
-                is_causal=(mask is None),
-            )
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-            if mask is not None:
-                att.masked_fill_(mask.logical_not(), float("-inf"))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).reshape(
-            B, T, C
-        )  # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
-
 class MLP(nn.Module):
     def __init__(self, config: FeatureRNNConfig):
         super().__init__()
@@ -168,30 +76,6 @@ class MLP(nn.Module):
         x = self.dropout(x)
         return x
 
-class VanillaAttentionBlock(nn.Module):
-    def __init__(self, config: FeatureRNNConfig, n_head: Optional[int] = None):
-        super().__init__()
-        self.ln_1 = LayerNorm(
-            config.n_embd,
-            bias=config.bias,
-        )
-        self.attn = VanillaSelfAttention(config, n_head=n_head)
-        self.ln_2 = LayerNorm(
-            config.n_embd,
-            bias=config.bias,
-        )
-        self.mlp = MLP(config)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
-        rope: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x), mask=mask, rope=rope)
-        x = x + self.mlp(self.ln_2(x))
-        return x
-
 class FeatureAttention(nn.Module):
     """Highly optimized Attention with decomposed U and V operation matrices and intent-feature casting."""
 
@@ -201,6 +85,7 @@ class FeatureAttention(nn.Module):
         n_head: int,
         dropout: float,
         bias: bool,
+        use_vanilla_attn: bool,
         n_fixed_feature_embeddings: int,
         n_model_split_u: int,
         n_model_split_v: int,
@@ -223,41 +108,51 @@ class FeatureAttention(nn.Module):
         self.omit_u_matrix = omit_u_matrix
         self.omit_v_matrix = omit_v_matrix
         self.dtype = dtype
+        self.use_vanilla_attn = use_vanilla_attn
 
         self.fixed_features = nn.Parameter(
             torch.empty(1, n_fixed_feature_embeddings, n_embd, dtype=dtype)
         )
 
-        self.intent = nn.Linear(n_embd, n_embd, bias=bias, dtype=dtype)
+        # self.intent = nn.Linear(n_embd, n_embd, bias=bias, dtype=dtype)
+        self.intent_operator = nn.Linear(n_embd, n_embd, bias=bias, dtype=dtype)
         self.feature = nn.Linear(n_embd, n_embd, bias=bias, dtype=dtype)
-        # Need to declare them as 2D to allow Muon to pick them up as params
-        self.op_u = (
-            nn.Parameter(
-                torch.empty(n_head * self.head_dim, n_model_split_u, dtype=dtype)
+        self.value_proj = None
+        self.op_u = None
+        self.op_v = None
+        if self.use_vanilla_attn:
+            self.value_proj = nn.Linear(n_embd, n_embd, bias=bias, dtype=dtype)
+        else:
+            # Operand query only applies for lambda attn
+            # When the current embedding is testified as operand of previous embedding
+            self.intent_operand = nn.Linear(n_embd, n_embd, bias=bias, dtype=dtype)
+            # Need to declare them as 2D to allow Muon to pick them up as params
+            self.op_u = (
+                nn.Parameter(
+                    torch.empty(n_head * self.head_dim, n_model_split_u, dtype=dtype)
+                )
+                if not omit_u_matrix
+                else None
             )
-            if not omit_u_matrix
-            else None
-        )
-        self.op_v = (
-            nn.Parameter(
-                torch.empty(n_head * n_model_split_v, self.head_dim, dtype=dtype)
+            self.op_v = (
+                nn.Parameter(
+                    torch.empty(n_head * n_model_split_v, self.head_dim, dtype=dtype)
+                )
+                if not omit_v_matrix
+                else None
             )
-            if not omit_v_matrix
-            else None
-        )
         # TODO - test component performance impact
+        self.logit_norm = nn.InstanceNorm2d(num_features=self.n_head, affine=False)
         self.output_proj = nn.Linear(n_embd, n_embd, bias=bias, dtype=dtype)
         self.dropout = dropout
         self.resid_dropout = (
             nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         )
-        nn.init.normal_(self.fixed_features, mean=0.0, std=0.02)
+        nn.init.normal_(self.fixed_features, mean=0.0, std=1.0)
         if self.op_u is not None:
-            nn.init.normal_(self.op_u, mean=0.0, std=1.0/math.sqrt(n_model_split_u))
+            nn.init.normal_(self.op_u, mean=0.0, std=1.0 / self.sqrt_head_dim)
         if self.op_v is not None:
-            nn.init.normal_(self.op_v, mean=0.0, std=1.0/math.sqrt(n_model_split_v))
-        self.debug_name = "feature_attention"
-        self._debug_gradient_reported = False
+            nn.init.normal_(self.op_v, mean=0.0, std=1.0 / self.sqrt_head_dim)
 
     def orthogonal_regularization_loss(self) -> torch.Tensor:
         loss = self.fixed_features.new_zeros(())
@@ -279,36 +174,17 @@ class FeatureAttention(nn.Module):
             loss = loss + (v @ v.transpose(-1, -2) - identity_v).square().mean()
         return loss
 
-    def _debug_tensor(
-        self,
-        name: str,
-        tensor: torch.Tensor,
-        stats_values: Optional[torch.Tensor] = None,
-    ):
-        values = (tensor if stats_values is None else stats_values).detach().float()
-        print(
-            f"[FeatureRNN debug] {self.debug_name}.{name}: "
-            f"shape={tuple(values.shape)} finite={torch.isfinite(values).all().item()} "
-            f"abs_max={values.abs().max().item()} "
-            f"rms={values.square().mean().sqrt().item()}"
-        )
-        if tensor.requires_grad:
-            def report_gradient(gradient: torch.Tensor) -> torch.Tensor:
-                if gradient is not None:
-                    values = gradient.detach().float()
-                    print(
-                        f"[FeatureRNN debug] {self.debug_name}.{name}.grad: "
-                        f"finite={torch.isfinite(values).all().item()} "
-                        f"abs_max={values.abs().max().item():.4e} "
-                        f"rms={values.square().mean().sqrt().item():.4e}"
-                    )
-                else:
-                    print(f"[FeatureRNN debug] {self.debug_name}.{name}.grad: None")
-                return gradient
-
-            tensor.register_hook(report_gradient)
-
     def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        rope: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        if self.use_vanilla_attn:
+            return self.forward_vanilla_attn(x, mask, rope)
+        return self.forward_lambda_attn(x, mask, rope)
+
+    def forward_vanilla_attn(
         self,
         x: torch.Tensor,
         mask: torch.Tensor,
@@ -319,20 +195,63 @@ class FeatureAttention(nn.Module):
         x = torch.concat( (broadcasted_fixed_features, x), dim=1 )
         seq_len += self.n_fixed_feature_embeddings
 
-        intent = self.intent(x).view(
+        # "Key" in both vanilla / lambda attention
+        keys = self.feature(x).view(
             batch_size, seq_len, self.n_head, self.head_dim
         ).transpose(1, 2)
+
+        # "Value" formulation
+        values = self.value_proj(x).view(
+            batch_size, seq_len, self.n_head, self.head_dim
+        ).transpose(1, 2)
+
+        # "Q" formulation
+        query = self.intent_operator(x).view(
+            batch_size, seq_len, self.n_head, self.head_dim
+        ).transpose(1, 2)
+        # Add rot pos emb to "intent" and "feature"
+        if rope is not None:
+            query, keys = RotaryPositionEmbedding.apply(
+                query, keys, rope
+            )
+
+        scores = torch.einsum('bhim,bhjm->bhij', query, keys)
+        scores = self.logit_norm(scores)
+        scores = scores.masked_fill(~mask[None, None, :, :], float('-inf'))
+
+        # Softmax into attn scores
+        attn_weights = F.softmax(scores, dim=-1)
+        # Revisit fwd & back to yield the attention result; batch, head, idx, head_dim
+        attn =  torch.einsum('bhij,bhjm->bhim', attn_weights, values)
+        # print(f"attn_w: \n{attn_weights}")
+        # print(f"attn: \n{attn}")
+
+        output = attn.transpose(1, 2).reshape(
+            batch_size, seq_len, self.n_embd)
+        output = self.output_proj(output)
+        output = self.resid_dropout(output)[
+            :, self.n_fixed_feature_embeddings:, :
+        ]
+        
+        return output
+
+    def forward_lambda_attn(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        rope: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        batch_size, seq_len, _ = x.size()
+        broadcasted_fixed_features = self.fixed_features.expand(batch_size, -1, -1)
+        x = torch.concat( (broadcasted_fixed_features, x), dim=1 )
+        seq_len += self.n_fixed_feature_embeddings
+
+        # "Key" in both vanilla / lambda attention
         features = self.feature(x).view(
             batch_size, seq_len, self.n_head, self.head_dim
         ).transpose(1, 2)
 
-        if rope is not None:
-            intent, features = RotaryPositionEmbedding.apply(
-                intent, features, rope
-            )
-            intent = intent.to(dtype=self.dtype)
-            features = features.to(dtype=self.dtype)
-
+        # "Value" formulation
         # Since we have U >= V, muliplying U first is more efficient than multiplying V first.
         reshaped_e = x.reshape(
             batch_size, seq_len, self.n_model_split_u, self.n_model_split_v
@@ -356,7 +275,7 @@ class FeatureAttention(nn.Module):
             operations = torch.einsum("bkhiv,hvj->bkhij", ue, reshaped_v)
         # batch, head, seq, head_dim, head_dim
         # Each position is sum of head_dim components - variance scale back
-        operations = operations.permute(0, 2, 1, 3, 4).contiguous() / self.sqrt_head_dim
+        operations = operations.permute(0, 2, 1, 3, 4).contiguous()
 
         if mask.ndim != 2 or mask.shape != (seq_len, seq_len):
             raise ValueError(
@@ -371,22 +290,44 @@ class FeatureAttention(nn.Module):
         # print(features.shape)
         # print(calculated.shape)
 
+        # "Q" formulation
+        intent_operator = self.intent_operator(x).view(
+            batch_size, seq_len, self.n_head, self.head_dim
+        ).transpose(1, 2)
+        intent_operand = self.intent_operand(x).view(
+            batch_size, seq_len, self.n_head, self.head_dim
+        ).transpose(1, 2)
+        # Add rot pos emb to "intent" and "feature"
+        if rope is not None:
+            combined_intent = torch.concat((intent_operator, intent_operand), dim=1)
+            combined_intent, features = RotaryPositionEmbedding.apply(
+                combined_intent, features, rope
+            )
+            intent_operator = combined_intent[:, :self.n_head, :, :]
+            intent_operand = combined_intent[:, self.n_head:, :, :]
+
         # Sadly, our attn depends on both i and j - flash attention not applicable...
-        scores_fwd = torch.einsum('bhim,bhijm->bhij', intent, calculated)
-        scores_back = torch.einsum('bhim,bhjim->bhij', intent, calculated)
+        scores_fwd = torch.einsum('bhim,bhjm->bhij', intent_operand, features)
+        scores_back = torch.einsum('bhim,bhjm->bhij', intent_operator, features)
         # scores_raw = torch.einsum('bhim,bhjm->bhij', intent, features)
-        # Mask out the not-allowed attention positions
-        scores_fwd = scores_fwd.masked_fill(~mask[None, None, :, :], float('-inf'))
-        scores_back = scores_back.masked_fill(~mask[None, None, :, :], float('-inf'))
-        scores = torch.concat((scores_fwd, scores_back), dim=-1) / self.sqrt_two_head_dim
+        # Mask out the not-allowed attention positions and i-i double counting
+        mask_fwd = mask.clone()
+        mask_back = mask.clone()
+        mask_fwd.fill_diagonal_(False)
+        scores_fwd = self.logit_norm(scores_fwd)
+        scores_back = self.logit_norm(scores_back)
+        scores_fwd = scores_fwd.masked_fill(~mask_fwd[None, None, :, :], float('-inf'))
+        scores_back = scores_back.masked_fill(~mask_back[None, None, :, :], float('-inf'))
+        scores = torch.concat((scores_fwd, scores_back), dim=-1)
         # print(f"score_fwd: \n{scores_fwd}")
         # print(f"score_b: \n{scores_back}")
         # print(f"score: \n{scores}")
-        # Softmax and sum over "j" overall
+
+        # Softmax into attn scores
         attn_weights = F.softmax(scores, dim=-1)
         # Revisit fwd & back to yield the attention result; batch, head, idx, head_dim
         attn =  torch.einsum('bhij,bhijm->bhim', attn_weights[:,:,:,:seq_len], calculated) + \
-                torch.einsum('bhij,bhjim->bhim', attn_weights[:,:,:,seq_len:seq_len*2], calculated)
+                torch.einsum('bhij,bhjim->bhim', attn_weights[:,:,:,seq_len:], calculated)
         # print(f"attn_w: \n{attn_weights}")
         # print(f"attn: \n{attn}")
 
@@ -396,37 +337,7 @@ class FeatureAttention(nn.Module):
         output = self.resid_dropout(output)[
             :, self.n_fixed_feature_embeddings:, :
         ]
-
-        # if torch.rand((1,1))[0,0] < 0.01:
-        #     reshaped_u = self.op_u.reshape(
-        #         self.n_head, self.head_dim, self.n_model_split_u
-        #     )
-        #     reshaped_v = self.op_v.reshape(
-        #         self.n_head, self.n_model_split_v, self.head_dim
-        #     )
-        #     print("Sampled UTU:")
-        #     for i in range(self.n_head):
-        #         print(reshaped_u[i,:,:].transpose(0, 1) @ reshaped_u[i,:,:])
-        #     print("Sampled VVT:")
-        #     for i in range(self.n_head):
-        #         print(reshaped_v[i,:,:] @ reshaped_v[i,:,:].transpose(0, 1))
-
-        if (
-            FEATURE_RNN_DEBUG_GRADIENTS
-            and self.training
-            and not self._debug_gradient_reported
-        ):
-            for name, tensor in (
-                ("intent", intent),
-                ("features", features),
-                ("operations", operations),
-                ("output", output),
-                ("u", self.op_u),
-                ("v", self.op_v),
-            ):
-                if tensor is not None:
-                    self._debug_tensor(name, tensor)
-            self._debug_gradient_reported = True
+        
         return output
 
 
@@ -434,7 +345,8 @@ class FeatureRNNBlock(nn.Module):
     def __init__(
         self,
         config: FeatureRNNConfig,
-        n_head: int
+        n_head: int,
+        use_vanilla_attn: bool,
     ):
         super().__init__()
         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
@@ -443,6 +355,7 @@ class FeatureRNNBlock(nn.Module):
             n_head,
             config.dropout,
             config.bias,
+            use_vanilla_attn,
             config.n_fixed_feature_embeddings,
             config.n_model_split_u,
             config.n_model_split_v,
@@ -532,7 +445,7 @@ class FeatureRNNTransformer(FusedCrossEntropyLoss, nn.Module):
         )
         # If not recurrent, don't init it at all - otherwise Muon will think it's in use
         shared_recurrent_block = (
-            FeatureRNNBlock(config, config.n_head)
+            FeatureRNNBlock(config, config.n_head, use_vanilla_attn=USE_VANILLA_ATTN)
             if config.recurrent_inference
             else None
         )
@@ -540,8 +453,8 @@ class FeatureRNNTransformer(FusedCrossEntropyLoss, nn.Module):
             dict(
                 feature_selection=nn.ModuleList(
                     [
-                        VanillaAttentionBlock(
-                            config, config.feature_selection_heads
+                        FeatureRNNBlock(
+                            config, config.feature_selection_heads, use_vanilla_attn=True
                         )
                         for _ in range(config.feature_selection_layers)
                     ]
@@ -550,7 +463,7 @@ class FeatureRNNTransformer(FusedCrossEntropyLoss, nn.Module):
                     [
                         shared_recurrent_block
                         if shared_recurrent_block is not None
-                        else FeatureRNNBlock(config, config.n_head)
+                        else FeatureRNNBlock(config, config.n_head, use_vanilla_attn=USE_VANILLA_ATTN)
                         for _ in range(
                             config.n_layer - config.feature_selection_layers
                         )
@@ -564,9 +477,6 @@ class FeatureRNNTransformer(FusedCrossEntropyLoss, nn.Module):
         )
 
         self.apply(self._init_weights)
-        for name, module in self.named_modules():
-            if isinstance(module, FeatureAttention):
-                module.debug_name = name
 
     @staticmethod
     def _init_weights(module: nn.Module):
@@ -729,15 +639,15 @@ class FeatureRNN(ModelBase):
         targets = batch[:, 1:]
         # Unlike baseline GPT models, feature attention only sees marginal gains by including prefix
         # Isn't woth the extra effort to predict entropy-heavy prefix
-        # if not 0 <= self.config.context_length < targets.size(1):
-        #     raise ValueError(
-        #         f"context_length must be in [0, {targets.size(1) - 1}], "
-        #         f"got {self.config.context_length}"
-        #     )
-        # target_positions = torch.arange(targets.size(1), device=targets.device)
-        # targets = targets.masked_fill(
-        #     (target_positions < self.config.context_length).unsqueeze(0), -100
-        # )
+        if not 0 <= self.config.context_length < targets.size(1):
+            raise ValueError(
+                f"context_length must be in [0, {targets.size(1) - 1}], "
+                f"got {self.config.context_length}"
+            )
+        target_positions = torch.arange(targets.size(1), device=targets.device)
+        targets = targets.masked_fill(
+            (target_positions < self.config.context_length).unsqueeze(0), -100
+        )
 
         if backpropagate and self._pair_accuracy_counts is None:
             self._pair_accuracy_counts = torch.zeros(
@@ -820,40 +730,39 @@ class FeatureRNN(ModelBase):
             for name, parameter in self.model.named_parameters()
             if parameter.requires_grad
         ]
-        print(f"Configuring optimizers for {len(named_parameters)} trainable parameters")
+        # print([name for name, _ in named_parameters])
+        # TODO - replication
         muon_named_parameters = [
-            (name, parameter)
-            for name, parameter in named_parameters
-            if parameter.ndim == 2
-            and not name.endswith("token_embedding.weight")
-            and not name.endswith("lm_head.weight")
+            # (name, parameter)
+            # for name, parameter in named_parameters
+            # if parameter.ndim == 2
+            # and not name.endswith("token_embedding.weight")
+            # and not name.endswith("lm_head.weight")
         ]
+        # print([name for name, _ in muon_named_parameters])
         muon_parameters = [parameter for _, parameter in muon_named_parameters]
-        print(f"Muon Params: {[name for name, _ in muon_named_parameters]}")
-        adamw_decay_parameters = [
-            (name, parameter)
+        muon_parameter_ids = {id(parameter) for parameter in muon_parameters}
+        adamw_decay = [
+            parameter
             for name, parameter in named_parameters
             if parameter.ndim >= 2
-            and (
-                parameter.ndim != 2
-                or name.endswith("token_embedding.weight")
-                or name.endswith("lm_head.weight")
-            )
+            and not name.endswith("token_embedding.weight")
+            and not name.endswith("lm_head.weight")
+            and id(parameter) not in muon_parameter_ids
         ]
-        adamw_decay = [parameter for _, parameter in adamw_decay_parameters]
-        print(f"Adamw Decay Params: {[name for name, _ in adamw_decay_parameters]}")
-        adamw_no_decay_parameters = [
-            (name, parameter) for name, parameter in named_parameters if parameter.ndim < 2
+        adamw_no_decay = [
+            parameter 
+            for name, parameter in named_parameters
+            if parameter.ndim < 2
+            or name.endswith("token_embedding.weight")
+            or name.endswith("lm_head.weight")
+            and id(parameter) not in muon_parameter_ids
         ]
-        adamw_no_decay = [parameter for _, parameter in adamw_no_decay_parameters]
-        print(f"Adamw No Decay Params: {[name for name, _ in adamw_no_decay_parameters]}")
-        # Sanity checks
-        trainable_ids = {id(parameter) for _, parameter in named_parameters}
-        muon_parameter_ids = {id(parameter) for parameter in muon_parameters}
         optimizer_parameter_ids = [
             id(parameter)
             for parameter in muon_parameters + adamw_decay + adamw_no_decay
         ]
+        trainable_ids = {id(parameter) for _, parameter in named_parameters}
         if (
             len(optimizer_parameter_ids) != len(set(optimizer_parameter_ids))
             or set(optimizer_parameter_ids) != trainable_ids
@@ -862,19 +771,18 @@ class FeatureRNN(ModelBase):
                 "Muon and AdamW parameter groups must cover every trainable "
                 "parameter exactly once"
             )
-        # print(f"Muon parameter names: {[name for name, _ in muon_named_parameters]}")
-        # print(
-        #     "AdamW-only parameter names: "
-        #     f"{[name for name, parameter in named_parameters if id(parameter) not in muon_parameter_ids]}"
-        # )
 
-        self.optimizer_muon = muon_class(
-            muon_parameters,
-            lr=learning_rate,
-            weight_decay=weight_decay,
-            momentum=muon_momentum,
-            adjust_lr_fn="match_rms_adamw",
-        )
+        if muon_parameters:
+            self.optimizer_muon = muon_class(
+                muon_parameters,
+                lr=learning_rate,
+                weight_decay=weight_decay,
+                momentum=muon_momentum,
+                adjust_lr_fn="match_rms_adamw",
+            )
+        else:
+            self.optimizer_muon = None
+            print("BST Model is not using Muon optimizer.")
         self.optimizer_adamw = torch.optim.AdamW(
             [
                 {"params": adamw_decay, "weight_decay": weight_decay},
@@ -885,36 +793,56 @@ class FeatureRNN(ModelBase):
             eps=1e-8,
             fused=use_fused,
         )
-        self.optimizer = self.optimizer_muon
+        self.optimizer = self.optimizer_muon if self.optimizer_muon is not None else self.optimizer_adamw
 
     def optimizer_step(
         self,
-        learning_rate: Optional[float] = None,
-        grad_clip: Optional[float] = None,
+        learning_rate: Optional[float] = None,  # If given, use this learning rate
+        grad_clip: Optional[float] = None,  # If given, clip gradient norm
     ) -> Optional[torch.Tensor]:
+        """
+        Performs a single optimization step.
+        If gradient clipping is enabled, return the gradient norm before clipping.
+        """
         self._assert_fabric_is_setup()
-        if self.optimizer_muon is None or self.optimizer_adamw is None:
-            raise RuntimeError("Optimizers must be set up before calling this function")
-        optimizers = (self.optimizer_muon, self.optimizer_adamw)
+
+        # Update learning rate
         if learning_rate is not None:
-            for optimizer in optimizers:
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = learning_rate
+            for optimizer in (self.optimizer_muon, self.optimizer_adamw):
+                if optimizer is not None:
+                    for param_group in optimizer.param_groups:
+                        param_group["lr"] = learning_rate
+
+        # Clip gradient
         grad_norm = None
         if grad_clip is not None:
             group_norms = []
-            for optimizer in optimizers:
-                group_norm = self.fabric.clip_gradients(
-                    self.model, optimizer, max_norm=grad_clip
-                )
-                if group_norm is not None:
-                    group_norms.append(group_norm)
+            for optimizer in (self.optimizer_muon, self.optimizer_adamw):
+                if optimizer is not None:
+                    encoder_grad_norm = self.fabric.clip_gradients(
+                        self.encoder, optimizer, max_norm=grad_clip
+                    )
+                    texthead_grad_norm = self.fabric.clip_gradients(
+                        self.text_head, optimizer, max_norm=grad_clip
+                    )
+                    group_norms.extend(
+                        norm
+                        for norm in (encoder_grad_norm, texthead_grad_norm)
+                        if norm is not None
+                    )
             if group_norms:
                 grad_norm = torch.linalg.vector_norm(torch.stack(group_norms))
-        for optimizer in optimizers:
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+
+        # Step optimizer
+        for optimizer in (self.optimizer_muon, self.optimizer_adamw):
+            if optimizer is not None:
+                optimizer.step()
+        for optimizer in (self.optimizer_muon, self.optimizer_adamw):
+            if optimizer is not None:
+                optimizer.zero_grad(set_to_none=True)
         self.training_steps += 1
+
+        # Return gradient norm
         return grad_norm
 
     def compile(self):

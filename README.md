@@ -1,11 +1,20 @@
 # A fork of the original 
 
-# Stargraph - train
+## Setup venv for linux (wsl Ubuntu)
+> wsl
+> cd ~
+> python3 -m venv venv
+> cd /mnt/c/Users/User/Desktop/coding/AI/stargraph_LLM/BST
+> source ~/venv/bin/activate
+Check https://pytorch.org/get-started/locally/ to get the torch version suitable for CUDA first
+> pip install -r requirements.txt
+
+## Stargraph - train
 To start Ubuntu
 > wsl
 
-cd /mnt/c/Users/User/Desktop/coding/AI/stargraph_LLM/BST
-source ~/venv/bin/activate
+> cd /mnt/c/Users/User/Desktop/coding/AI/stargraph_LLM/BST
+> source ~/venv/bin/activate
 
 Data preparation:
 > python data/stargraph/prepare.py --num_samples 1000000 --num_paths 5 --path_length 5 --max_nodes 50
@@ -19,14 +28,16 @@ Feature RNN:
 > python train.py --config config/feature_rnn_stargraph_mini.yaml data.stargraph_data_path="data/stargraph/graph_5_5_sample_1000000.txt"
 > python train.py --config config/feature_rnn_stargraph_mini.yaml data.stargraph_data_path="data/stargraph/graph_5_5_sample_1000000_general_tree.txt"
 
-# Stargraph - visualize
+## Stargraph - visualize
 
 When file logging is enabled, visualize pair accuracy metric with:
-Set-ExecutionPolicy Unrestricted -Scope Process
-.\windows_venv\Scripts\activate.ps1
 
-python visualize_pair_accuracy.py out/REPLACE_THIS/version_0/metrics.csv
+> python visualize_pair_accuracy.py out/REPLACE_THIS/version_0/metrics.csv
 
+
+If using windows python venv, run:
+> Set-ExecutionPolicy Unrestricted -Scope Process
+> .\venv\Scripts\activate.ps1
 
 
 # Below: readme from original repo

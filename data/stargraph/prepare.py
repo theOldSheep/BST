@@ -49,7 +49,7 @@ def general_tree_graph_maker(
             valid_goals = list(degree_lookup[lenOfEachPath - 1])
             goal = valid_goals[random.randint(0, len(valid_goals) - 1)]
             trace_item = goal
-            path = [source]
+            path = []
             for _ in range(lenOfEachPath):
                 path.append(trace_item)
                 trace_item = parent[trace_item]
@@ -87,6 +87,7 @@ def star_or_sink_graph_maker(
             goal = oldNode
 
     if shuffle_edge_lists:
+        # edgeList = [(a,b) if random.randint(0,1) == 0 else (b,a) for (a,b) in edgeList]
         random.shuffle(edgeList)
 
     if reverse:

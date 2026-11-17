@@ -16,7 +16,7 @@ trainer:
 data:
   dataset: stargraph
   effective_batch_size: 60
-  gradient_accum_steps: 1
+  gradient_accum_steps: 2
   pair_accum_steps: 1
   goal_range: [25, 75]
   num_workers: 0
@@ -26,18 +26,19 @@ data:
 model:
   architecture: feature_rnn
   n_layer: 8
-  n_head: 8
+  n_head: 4
   n_embd: 256
+  dtype: float32
   dropout: 0.0
-  bias: true
+  bias: false
   vocab_size: 0 #will be overwritten by datamodule
   block_size: 512
   context_length: 0
   gpt_mode: next_token
   # Feature attn specific
-  feature_selection_layers: 0
-  feature_selection_heads: 8
-  feature_selection_backward_distance: 7
+  feature_selection_layers: 1
+  feature_selection_heads: 4
+  feature_selection_backward_distance: 5
   rope_enabled_for_inference: true
   recurrent_inference: false
   # Number of fixed augmented embedding per attn block
@@ -50,7 +51,7 @@ model:
 
 optimizer:
   learning_rate: 3e-4
-  weight_decay: 0.0001
+  weight_decay: 0.0
   beta1: 0.9
   beta2: 0.95
   muon_momentum: 0.95
@@ -60,4 +61,4 @@ lr_scheduler:
   decay_lr: false
   warmup_iters: 100
   lr_decay_iters: 600000
-  min_lr: 0.0002
+  min_lr: 1e-5
