@@ -1,6 +1,9 @@
 import argparse
 import json
 import os
+from array import array
+
+import numpy as np
 import torch
 import torch.nn.functional as F
 import lightning as L
@@ -10,9 +13,11 @@ from datetime import datetime
 from omegaconf import OmegaConf
 from queue import PriorityQueue
 from tqdm import trange
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from core_train import initialize_model
+from data.pretokenized import PretokenizedDataModule
+from data.stargraph import StarGraphDataModule
 from data.tinystories import TinyStoriesDataModule
 from model_bst import BST
 from model_feature_rnn import FeatureRNN
@@ -120,6 +125,135 @@ class Inference:
         # Set model to eval mode
         self.model.eval()
 
+    @torch.inference_mode()
+    def evaluate_token_metrics(
+        self, dataloader, eval_type: str, num_samples: int
+    ) -> List[Dict[str, Union[float, int]]]:
+        """Evaluate forward next-token probability and accuracy by target position."""
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
+
+        probabilities_by_position = []
+        correct_by_position = []
+        counts_by_position = []
+        samples_evaluated = 0
+
+        for batch in dataloader:
+            # print(f"batch: {batch} of type {type(batch)}")
+            tokens = batch.get("input_ids") if isinstance(batch, dict) else batch
+            # print(f"tokens: {tokens} of type {type(tokens)}")
+            if not isinstance(tokens, torch.Tensor):
+                raise TypeError(
+                    "Evaluation batches must be token tensors or contain input_ids"
+                )
+            tokens = tokens.unsqueeze(0) if tokens.ndim == 1 else tokens
+            if tokens.ndim != 2:
+                raise ValueError(
+                    f"Expected evaluation tokens with 1 or 2 dimensions, got {tokens.shape}"
+                )
+
+            for sequence in tokens.to(self.fabric.device):
+                if samples_evaluated >= num_samples:
+                    break
+
+                # Stargraph forward evaluation: predict sequence[1:] from sequence[:-1]
+                targets = sequence[1:]
+                if targets.numel() > 0:
+                    logits = self._forward_next_token_logits(sequence[:-1])
+                    # print("SEQ", sequence, sequence.shape)
+                    # print("LOGIT", logits, logits.shape)
+                    # print("TGT", targets, targets.shape)
+                    probs = logits.softmax(dim=-1)
+                    # print("PROBS", probs, probs.shape)
+                    probs = probs.gather(
+                        dim=0, index=targets.unsqueeze(-1),
+                    ).squeeze()
+                    correct = (logits.argmax(dim=-1) == targets).squeeze()
+                    positions = torch.arange(
+                        1, targets.numel() + 1, device=targets.device
+                    )
+                    self._record_token_predictions(
+                        positions,
+                        probs,
+                        correct,
+                        probabilities_by_position,
+                        correct_by_position,
+                        counts_by_position,
+                    )
+
+                samples_evaluated += 1
+
+            if samples_evaluated >= num_samples:
+                break
+
+        results = []
+        self.fabric.print(
+            f"Token-wise median probability and accuracy ({eval_type} dataset) "
+            f"(evaluated {samples_evaluated} sequences)"
+        )
+        self.fabric.print("position,median_probability,accuracy,count")
+        for position, probabilities in enumerate(probabilities_by_position):
+            count = counts_by_position[position]
+            if count == 0:
+                continue
+            result = {
+                "position": position,
+                "median_probability": float(np.median(probabilities)),
+                "accuracy": correct_by_position[position] / count,
+                "count": count,
+            }
+            results.append(result)
+            self.fabric.print(
+                f"{position},{result['median_probability']:.6f},"
+                f"{result['accuracy']:.6f},{count}"
+            )
+        if not results:
+            self.fabric.print("No valid token predictions were evaluated.")
+        return results
+
+    def _forward_next_token_logits(self, prefix: torch.Tensor) -> torch.Tensor:
+        """Return next-token logits of shape (prefix_len, vocab_size) for any model."""
+        # Crop to block_size if needed
+        prefix = prefix[-self.model.config.block_size :]
+        x = prefix.unsqueeze(0)
+
+        if isinstance(self.model, BST):
+            fwd_emb, bwd_emb = self.model.encoder(x)
+            # Forward next-token inference: full forward embedding with empty backward embedding
+            bwd_ctx = bwd_emb[:, -1:, :].expand_as(fwd_emb)
+            logits = self.model.text_head(fwd_emb, bwd_ctx)[:, 0, :]
+            return logits.float().squeeze()
+
+        if isinstance(self.model, (GPT, FeatureRNN)):
+            out = self.model.model(x)
+            logits = out[0] if isinstance(out, tuple) else out
+            return logits[0].float().squeeze()
+
+        raise TypeError(f"Unsupported model type: {type(self.model).__name__}")
+
+    @staticmethod
+    def _record_token_predictions(
+        positions: torch.Tensor,
+        probabilities: torch.Tensor,
+        correct: torch.Tensor,
+        probabilities_by_position: List[array],
+        correct_by_position: List[int],
+        counts_by_position: List[int],
+    ):
+        positions = positions.cpu().tolist()
+        probabilities = probabilities.cpu().tolist()
+        correct = correct.cpu().tolist()
+        for position, probability, is_correct in zip(
+            positions, probabilities, correct
+        ):
+            while position >= len(probabilities_by_position):
+                probabilities_by_position.append(array("f"))
+                correct_by_position.append(0)
+                counts_by_position.append(0)
+            probabilities_by_position[position].append(probability)
+            correct_by_position[position] += int(is_correct)
+            counts_by_position[position] += 1
+    
     @torch.inference_mode()
     def generate_samples(
         self,
@@ -1019,7 +1153,7 @@ if __name__ == "__main__":
         type=int,
         default=1,
         required=False,
-        help="Number of samples to generate for inference",
+        help="Number of sequences to generate or evaluate",
     )
     parser.add_argument(
         "--checkpoint_path", type=str, required=True, help="Path to the checkpoint file"
@@ -1034,7 +1168,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--sampling_mode",
         type=str,
-        required=True,
+        required=False,
         choices=(
             "AR",
             "beam",
@@ -1062,9 +1196,18 @@ if __name__ == "__main__":
         default=False,
         help="Use relative probability for goal_cond_plan algorithms",
     )
+    parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        help="Print token-wise median probability and accuracy instead of generating",
+    )
 
     parser.add_argument("-c", "--config", required=True)
     args, conf_cli = parser.parse_known_args()
+    if args.evaluate and args.sampling_mode is not None:
+        parser.error("--sampling_mode cannot be used with --evaluate")
+    if not args.evaluate and args.sampling_mode is None:
+        parser.error("Choose exactly one of --evaluate or --sampling_mode")
 
     default = OmegaConf.load("defaults.yaml")
     overrides = OmegaConf.load(args.config)
@@ -1085,10 +1228,24 @@ if __name__ == "__main__":
     print(yaml.dump(OmegaConf.to_container(config)))
 
     # Load data
-    datamodule = TinyStoriesDataModule(fabric, config)
+    datamodules = {
+        "tinystories": TinyStoriesDataModule,
+        "stargraph": StarGraphDataModule,
+        "pretokenized": PretokenizedDataModule,
+    }
+    if config.data.dataset not in datamodules:
+        raise ValueError(f"Unknown dataset: {config.data.dataset}")
+    datamodule = datamodules[config.data.dataset](fabric, config)
     datamodule.update_config(config)
 
-    eval_dataloader = datamodule.eval_dataloader()
+    if args.evaluate:
+        eval_dataloader = datamodule.val_dataloader()
+        test_dataloader = datamodule.test_dataloader()
+    else:
+        raise ValueError(
+            f"Generation is not supported for the {config.data.dataset} dataset"
+        )
+    
     tokenizer = datamodule.get_tokenizer()
 
     # Load model from checkpoint
@@ -1114,6 +1271,11 @@ if __name__ == "__main__":
         add_eos_token=True,
         use_relative_probability=args.relative_prob,
     )
+
+    if args.evaluate:
+        inference.evaluate_token_metrics(eval_dataloader, "eval", args.num_samples)
+        inference.evaluate_token_metrics(test_dataloader, "test", args.num_samples)
+        raise SystemExit(0)
 
     output_file = None
     if args.output_path:

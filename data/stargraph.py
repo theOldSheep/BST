@@ -110,6 +110,7 @@ class StarGraphDataModule:
         train_data, val_data, test_data = split_stargraph_data(data)
         self.train_dataset = StarGraphDataset(train_data, self.tokenizer)
         self.val_dataset = StarGraphDataset(val_data, self.tokenizer)
+        self.test_dataset = StarGraphDataset(test_data, self.tokenizer)
 
         graph_description_len, total_len = self._measure_index(data)
         print(
@@ -154,6 +155,17 @@ class StarGraphDataModule:
     def val_dataloader(self):
         dataloader = torch.utils.data.DataLoader(
             self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            drop_last=True,
+            collate_fn=self.collate_fn,
+        )
+        # This will automatically partition data between devices
+        return self.fabric.setup_dataloaders(dataloader, use_distributed_sampler=True)
+
+    def test_dataloader(self):
+        dataloader = torch.utils.data.DataLoader(
+            self.test_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             drop_last=True,
