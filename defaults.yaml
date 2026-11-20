@@ -77,7 +77,7 @@ model:
   n_head: 8
   n_embd: 768
   # "float16", "bfloat16", or "float32"
-  dtype: float16
+  dtype: float32
   dropout: 0.0
   bias: false
   # Total number of tokens in the vocabulary
@@ -105,13 +105,14 @@ model:
   # Inference layers options
   rope_enabled_for_inference: true
   recurrent_inference: false
+  use_vanilla_attn: true
   n_fixed_feature_embeddings: 16
   # U and V for operation transformation, with UV = n_model and U > V 
   n_model_split_u: 32
   n_model_split_v: 24
   omit_u_matrix: false
   omit_v_matrix: false
-  orthogonal_regularization_factor: 1.0
+  orthogonal_regularization_factor: 0.0
 
   # GPT specific options
   # "next_token" or "fim"
@@ -122,6 +123,7 @@ optimizer:
   weight_decay: 0.1
   beta1: 0.9
   beta2: 0.95
+  use_muon: false
   muon_momentum: 0.95
   grad_clip: null
 

@@ -897,13 +897,14 @@ class BST(ModelBase):
         learning_rate: float,
         betas: Tuple[float, float],
         use_fused: Optional[bool] = None,
+        use_muon: bool = False,
         muon_momentum: float = 0.95,
     ):
         """
         Create Muon and AdamW optimizers for training the model.
         """
-        muon_class = getattr(torch.optim, "Muon", None)
-        if muon_class is None:
+        muon_class = getattr(torch.optim, "Muon", None) if use_muon else None
+        if use_muon and muon_class is None:
             raise RuntimeError(
                 "BST requires torch.optim.Muon, available in PyTorch 2.9 and newer."
             )
@@ -918,13 +919,17 @@ class BST(ModelBase):
             if parameter.requires_grad
         ]
         # print([name for name, _ in named_parameters])
-        muon_named_parameters = [
-            # (name, parameter)
-            # for name, parameter in named_parameters
-            # if parameter.ndim == 2
-            # and not name.endswith("token_embedding.weight")
-            # and not name.endswith("lm_head.weight")
-        ]
+        muon_named_parameters = (
+            [
+                (name, parameter)
+                for name, parameter in named_parameters
+                if parameter.ndim == 2
+                and not name.endswith("token_embedding.weight")
+                and not name.endswith("lm_head.weight")
+            ]
+            if use_muon
+            else []
+        )
         # print([name for name, _ in muon_named_parameters])
         muon_parameters = [parameter for _, parameter in muon_named_parameters]
         muon_parameter_ids = {id(parameter) for parameter in muon_parameters}
@@ -959,6 +964,7 @@ class BST(ModelBase):
             )
 
         if muon_parameters:
+            assert muon_class is not None
             self.optimizer_muon = muon_class(
                 muon_parameters,
                 lr=learning_rate,
@@ -968,7 +974,7 @@ class BST(ModelBase):
             )
         else:
             self.optimizer_muon = None
-            print("BST Model is not using Muon optimizer.")
+            print("BST is not using Muon optimizer.")
         self.optimizer_adamw = torch.optim.AdamW(
             [
                 {"params": adamw_decay, "weight_decay": weight_decay},

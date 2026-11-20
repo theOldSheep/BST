@@ -134,6 +134,9 @@ def initialize_model(
             recurrent_inference=config.model.get(
                 "recurrent_inference", feature_defaults.recurrent_inference
             ),
+            use_vanilla_attn=config.model.get(
+                "use_vanilla_attn", feature_defaults.use_vanilla_attn
+            ),
             n_fixed_feature_embeddings=config.model.get(
                 "n_fixed_feature_embeddings",
                 feature_defaults.n_fixed_feature_embeddings,
@@ -272,6 +275,7 @@ def initialize_model(
             learning_rate=config.optimizer.learning_rate,
             betas=(config.optimizer.beta1, config.optimizer.beta2),
             use_fused=use_fused,
+            use_muon=config.optimizer.get("use_muon", False),
             muon_momentum=config.optimizer.get("muon_momentum", 0.95),
         )
 

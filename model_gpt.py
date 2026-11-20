@@ -350,8 +350,12 @@ class GPT(ModelBase):
             self.optimizer_muon, self.optimizer_adamw = fabric.setup_optimizers(
                 self.optimizer_muon, self.optimizer_adamw
             )
+        elif self.optimizer_adamw is not None and not is_wrapped(self.optimizer_adamw):
+            self.optimizer_adamw = fabric.setup_optimizers(self.optimizer_adamw)
         if self.optimizer_muon is not None and self.optimizer_adamw is not None:
             self.optimizer = self.optimizer_muon
+        else:
+            self.optimizer = self.optimizer_adamw
 
     def compute_loss(
         self,
@@ -468,13 +472,14 @@ class GPT(ModelBase):
         learning_rate: float,
         betas: Tuple[float, float],
         use_fused: Optional[bool] = None,
+        use_muon: bool = False,
         muon_momentum: float = 0.95,
     ):
         """
         Create Muon and AdamW optimizers for training the model.
         """
-        muon_class = getattr(torch.optim, "Muon", None)
-        if muon_class is None:
+        muon_class = getattr(torch.optim, "Muon", None) if use_muon else None
+        if use_muon and muon_class is None:
             raise RuntimeError(
                 "GPT requires torch.optim.Muon, available in PyTorch 2.9 and newer."
             )
@@ -485,14 +490,17 @@ class GPT(ModelBase):
             if parameter.requires_grad
         ]
         # print([name for name, _ in named_parameters])
-        # TODO - replication
-        muon_named_parameters = [
-            # (name, parameter)
-            # for name, parameter in named_parameters
-            # if parameter.ndim == 2
-            # and not name.endswith("token_embedding.weight")
-            # and not name.endswith("lm_head.weight")
-        ]
+        muon_named_parameters = (
+            [
+                (name, parameter)
+                for name, parameter in named_parameters
+                if parameter.ndim == 2
+                and not name.endswith("token_embedding.weight")
+                and not name.endswith("lm_head.weight")
+            ]
+            if use_muon
+            else []
+        )
         # print([name for name, _ in muon_named_parameters])
         muon_parameters = [parameter for _, parameter in muon_named_parameters]
         muon_parameter_ids = {id(parameter) for parameter in muon_parameters}
@@ -527,6 +535,7 @@ class GPT(ModelBase):
             )
 
         if muon_parameters:
+            assert muon_class is not None
             self.optimizer_muon = muon_class(
                 muon_parameters,
                 lr=learning_rate,
@@ -536,7 +545,7 @@ class GPT(ModelBase):
             )
         else:
             self.optimizer_muon = None
-            print("BST Model is not using Muon optimizer.")
+            print("GPT is not using Muon optimizer.")
         self.optimizer_adamw = torch.optim.AdamW(
             [
                 {"params": adamw_decay, "weight_decay": weight_decay},
@@ -573,15 +582,12 @@ class GPT(ModelBase):
             group_norms = []
             for optimizer in (self.optimizer_muon, self.optimizer_adamw):
                 if optimizer is not None:
-                    encoder_grad_norm = self.fabric.clip_gradients(
-                        self.encoder, optimizer, max_norm=grad_clip
-                    )
-                    texthead_grad_norm = self.fabric.clip_gradients(
-                        self.text_head, optimizer, max_norm=grad_clip
+                    model_grad_norm = self.fabric.clip_gradients(
+                        self.model, optimizer, max_norm=grad_clip
                     )
                     group_norms.extend(
                         norm
-                        for norm in (encoder_grad_norm, texthead_grad_norm)
+                        for norm in (model_grad_norm,)
                         if norm is not None
                     )
             if group_norms:
@@ -634,6 +640,8 @@ class GPT(ModelBase):
         if self.optimizer_muon is not None and self.optimizer_adamw is not None:
             state["optimizer_muon"] = self.optimizer_muon
             state["optimizer_adamw"] = self.optimizer_adamw
+        elif self.optimizer_adamw is not None:
+            state["optimizer"] = self.optimizer_adamw
         return state
 
     @classmethod

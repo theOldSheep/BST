@@ -46,6 +46,7 @@ class ModelBase:
         learning_rate: float,
         betas: Tuple[float, float],
         use_fused: Optional[bool] = None,
+        use_muon: bool = False,
         muon_momentum: float = 0.95,
     ):
         """Create optimizer for training the model"""
