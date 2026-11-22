@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 from array import array
+import random
 
 import numpy as np
 import torch
@@ -20,7 +21,7 @@ from data.pretokenized import PretokenizedDataModule
 from data.stargraph import StarGraphDataModule
 from data.tinystories import TinyStoriesDataModule
 from model_bst import BST
-from model_feature_rnn import FeatureRNN
+from model_normalized import NormalizedModel
 from model_gpt import GPT
 
 
@@ -108,7 +109,7 @@ class Inference:
         self,
         fabric: L.Fabric,
         config,
-        model: Union[BST, GPT, FeatureRNN],
+        model: Union[BST, GPT, NormalizedModel],
         tokenizer,
         top_k: int = None,  # limit sampling to top K next tokens
         add_eos_token: bool = True,  # add EOS token to start of prompt and end of goal
@@ -118,7 +119,7 @@ class Inference:
         self.config = config
         self.model = model
         self.tokenizer = tokenizer
-        self.top_k = top_k if top_k > 0 else None
+        self.top_k = top_k if top_k is not None and top_k > 0 else None
         self.add_eos_token = add_eos_token
         self.use_relative_probability = use_relative_probability
 
@@ -127,10 +128,10 @@ class Inference:
 
     @torch.inference_mode()
     def evaluate_token_metrics(
-        self, dataloader, eval_type: str, num_samples: int
+        self, dataloader, eval_type: str, num_samples: Optional[int] = None
     ) -> List[Dict[str, Union[float, int]]]:
         """Evaluate forward next-token probability and accuracy by target position."""
-        if num_samples < 1:
+        if num_samples is not None and num_samples < 1:
             raise ValueError("num_samples must be positive")
 
         probabilities_by_position = []
@@ -153,7 +154,7 @@ class Inference:
                 )
 
             for sequence in tokens.to(self.fabric.device):
-                if samples_evaluated >= num_samples:
+                if num_samples is not None and samples_evaluated >= num_samples:
                     break
 
                 # Stargraph forward evaluation: predict sequence[1:] from sequence[:-1]
@@ -164,10 +165,11 @@ class Inference:
                     # print("LOGIT", logits, logits.shape)
                     # print("TGT", targets, targets.shape)
                     probs = logits.softmax(dim=-1)
-                    # print("PROBS", probs, probs.shape)
+                    # print("PROBS", probs.tolist(), probs.shape)
                     probs = probs.gather(
-                        dim=0, index=targets.unsqueeze(-1),
+                        dim=1, index=targets.unsqueeze(-1),
                     ).squeeze()
+                    # print("PROBS", probs.tolist(), probs.shape)
                     correct = (logits.argmax(dim=-1) == targets).squeeze()
                     positions = torch.arange(
                         1, targets.numel() + 1, device=targets.device
@@ -183,7 +185,7 @@ class Inference:
 
                 samples_evaluated += 1
 
-            if samples_evaluated >= num_samples:
+            if num_samples is not None and samples_evaluated >= num_samples:
                 break
 
         results = []
@@ -217,19 +219,45 @@ class Inference:
         prefix = prefix[-self.model.config.block_size :]
         x = prefix.unsqueeze(0)
 
-        if isinstance(self.model, BST):
-            fwd_emb, bwd_emb = self.model.encoder(x)
-            # Forward next-token inference: full forward embedding with empty backward embedding
-            bwd_ctx = bwd_emb[:, -1:, :].expand_as(fwd_emb)
-            logits = self.model.text_head(fwd_emb, bwd_ctx)[:, 0, :]
-            return logits.float().squeeze()
+        # Sanity check - full sequence inference v.s. shuffled suffix after a random index
+        # If the prediction for token index+1 changes, then the model has mis-implemented causal mask
+        sanity_check_idx = random.randint(0, x.size(1) - 2)
+        test_cases = [
+            x, 
+            torch.cat( 
+                (x[:, :sanity_check_idx + 1], torch.zeros_like(x[:, sanity_check_idx + 1 :])), 
+            dim=1)]
+        results = []
 
-        if isinstance(self.model, (GPT, FeatureRNN)):
-            out = self.model.model(x)
-            logits = out[0] if isinstance(out, tuple) else out
-            return logits[0].float().squeeze()
+        for case in test_cases:
+            if isinstance(self.model, BST):
+                fwd_emb, bwd_emb = self.model.encoder(case)
+                # Forward next-token inference: full forward embedding with empty backward embedding
+                bwd_ctx = bwd_emb[:, -1:, :].expand_as(fwd_emb)
+                logits = self.model.text_head(fwd_emb, bwd_ctx)[:, 0, :]
+                results.append( logits.float().squeeze() )
 
-        raise TypeError(f"Unsupported model type: {type(self.model).__name__}")
+            elif isinstance(self.model, (GPT, NormalizedModel)):
+                out = self.model.model(case)
+                logits = out[0] if isinstance(out, tuple) else out
+                results.append( logits[0].float().squeeze() )
+
+            else:
+                raise TypeError(f"Unsupported model type: {type(self.model).__name__}")
+
+        # Sanity check: next-token logits up to position i should be the same for both cases
+        delta = (results[0][:sanity_check_idx + 1] - results[1][:sanity_check_idx + 1])
+        delta = delta.abs_().max(dim=1, keepdim=False).values
+        if not torch.allclose(delta, torch.zeros_like(delta), atol=1e-4):
+            self.fabric.print(
+                "Warning: Next-token logits differ between full sequence and shuffled suffix. "
+                "This may indicate a mis-implemented causal mask in the model."
+            )
+            self.fabric.print(
+                "Results delta (max abs. magnitude at each index):"
+                f" {delta} "
+                f"(zero-out token after index {sanity_check_idx})")
+        return results[0]
 
     @staticmethod
     def _record_token_predictions(
@@ -299,9 +327,9 @@ class Inference:
             goal = batch[i, -suffix_len:]
 
             # Sampling methods for GPT model
-            if isinstance(model, (GPT, FeatureRNN)):
+            if isinstance(model, (GPT, NormalizedModel)):
                 if config.model.gpt_mode == "fim":
-                    if isinstance(model, (FeatureRNN)):
+                    if isinstance(model, (NormalizedModel)):
                         raise ValueError(
                             f"{type(model).__name__} supports only next-token "
                             "mode; FIM infilling is not supported."
@@ -366,7 +394,7 @@ class Inference:
             else:
                 raise ValueError(
                     f"Model not valid. {type(model)} is not supported. "
-                    "Must be BST, GPT, or FeatureRNN."
+                    "Must be BST, GPT, or Normalized Transformer."
                 )
 
     def _untokenize(self, tokens: torch.Tensor) -> str:

@@ -408,6 +408,41 @@ class LayerNorm(nn.Module):
             # just use RMSNorm
             return F.rms_norm(input, self.weight.shape, self.weight, self.eps)
 
+class MaskedIndexINorm(nn.Module):
+    """Normalize pre-softmax scores over index_i per (batch, head) for unmasked entries."""
+
+    def __init__(self, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, scores: torch.Tensor, mask_inclusion: torch.Tensor) -> torch.Tensor:
+        # scores: (B, H, I, J), mask: (I, J) bool
+        if mask_inclusion.dtype != torch.bool:
+            mask_inclusion = mask_inclusion.to(dtype=torch.bool)
+        # The I,J dims must match
+        if mask_inclusion.shape != scores.shape[-2:]:
+            raise ValueError(
+                f"Expected mask shape {scores.shape[-2:]}, got {tuple(mask_inclusion.shape)}"
+            )
+
+        orig_dtype = scores.dtype
+        x = scores.float()
+        # Sum over the key dim (J) for each query (I)
+        count = mask_inclusion.sum(dim=-1, keepdim=True).clamp(min=1)
+
+        # Mean and variance over dim=-2 (index_i) for each (B, H, J)
+        # Don't use mean/std since the 0.0 fallback ruins the result accuracy
+        masked_x = torch.where(mask_inclusion, x, 0.0)
+        mean = masked_x.sum(dim=-1, keepdim=True) / count
+
+        centered = torch.where(mask_inclusion, x - mean, 0.0)
+        var = (centered * centered).sum(dim=-1, keepdim=True) / count
+        # print("MaskedIndexNorm: mean", mean, "var", var, "count", count)
+        # print("MaskedIndexNorm: mean", scores.shape, mean.shape, "var", var.shape, "count", count.shape)
+        normed = centered * torch.rsqrt(var + self.eps)
+
+        # Keep non-masked entries normalized; preserve original values elsewhere
+        return torch.where(mask_inclusion, normed, x).to(dtype=orig_dtype)
 
 class SwiGLU(nn.Module):
     """Linear layer with SwiGLU activation function"""

@@ -1,41 +1,70 @@
 # A fork of the original 
 
-## Setup venv for linux (wsl Ubuntu)
-> wsl
-> cd ~
-> python3 -m venv venv
-> cd /mnt/c/Users/User/Desktop/coding/AI/stargraph_LLM/BST
-> source ~/venv/bin/activate
+## Setup venv for linux on windows (wsl Ubuntu)
+```powershell
+wsl
+cd ~
+python3 -m venv venv
+cd /mnt/c/Users/User/Desktop/coding/AI/stargraph_LLM/BST
+source ~/venv/bin/activate
+```
 Check https://pytorch.org/get-started/locally/ to get the torch version suitable for CUDA first
 > pip install -r requirements.txt
 
-## Stargraph - train
-To start Ubuntu
-> wsl
+To start Ubuntu after it is setup, open a powershell window and type:
+```powershell
+wsl
+cd /mnt/c/Users/User/Desktop/coding/AI/stargraph_LLM/BST
+source ~/venv/bin/activate
+```
 
-> cd /mnt/c/Users/User/Desktop/coding/AI/stargraph_LLM/BST
-> source ~/venv/bin/activate
-
-Data preparation:
+### Data preparation:
 > python data/stargraph/prepare.py --num_samples 1000000 --num_paths 5 --path_length 5 --max_nodes 50
-> python data/stargraph/prepare.py --num_samples 1000000 --num_paths 5 --path_length 5 --max_nodes 50 --general_tree True
+This will generate a G(5,5) stargraph
+> python data/stargraph/prepare.py --num_samples 1000000 --num_paths 5 --path_length 5 --max_nodes 50 --general_tree True --swap_edge_dir True
+This will generate a tree instead of a stargraph, with 50% chance of flipping edge indication direction
 
-Baseline:
-> python train.py --config config/gpt_stargraph_mini.yaml data.stargraph_data_path="data/stargraph/graph_5_5_sample_10000000.txt"
-Belief State Transformer:
-> python train.py --config config/bst_stargraph_mini.yaml data.stargraph_data_path="data/stargraph/graph_5_5_sample_1000000.txt"
-Feature RNN:
-> python train.py --config config/feature_rnn_stargraph_mini.yaml data.stargraph_data_path="data/stargraph/graph_5_5_sample_1000000.txt"
-> python train.py --config config/feature_rnn_stargraph_mini.yaml data.stargraph_data_path="data/stargraph/graph_5_5_sample_1000000_general_tree.txt"
+### Model training:
+> python train.py --config config/preset/REPLACE_THIS.yaml data.stargraph_data_path="data/stargraph/graph_5_5_sample_1000000.txt"
+> python train.py --config config/preset/REPLACE_THIS.yaml data.stargraph_data_path="data/stargraph/graph_5_5_sample_1000000_edgeswap_general_tree.txt"
 
-## Stargraph - visualize
+## Model configuration families:
+
+### GPT (Baseline)
+#### gpt.yaml
+GPT model with SGD optimizer
+#### gpt_muon.yaml
+GPT model with Muon optimizer
+
+### Belief State Transformers
+#### bst.yaml
+BST model with SGD optimizer
+#### bst_muon.yaml
+BST model with Muon optimizer
+
+
+### Normalized Transformer
+#### normalized_vanilla.yaml
+Feature RNN model with attention logit norm + vanilla attention blocks
+#### normalized_lambda.yaml
+Feature RNN model with attention logit norm + lambda attention blocks
+#### normalized_lambda_muon.yaml
+Feature RNN model with attention logit norm, lambda attention blocks and Muon optimizer
+
+
+
+## Stargraph - visualization and evaluation
+
+To print median true-token probability and accuracy by token position from a
+checkpoint, run:
+
+> python inference.py --config config/preset/bst_vanilla.yaml --checkpoint_path out/REPLACE_THIS/ckpt.pt --evaluate --num_samples 100
+
 
 When file logging is enabled, visualize pair accuracy metric with:
 
 > python visualize_pair_accuracy.py out/REPLACE_THIS/version_0/metrics.csv
-
-
-If using windows python venv, run:
+(If using windows python venv, run these first:)
 > Set-ExecutionPolicy Unrestricted -Scope Process
 > .\venv\Scripts\activate.ps1
 

@@ -128,12 +128,6 @@ def do_train(
             config, os.path.join(experiment_out_dir, "materialized_config.yaml")
         )
 
-    if config.use_bst and config.trainer.print_samples:
-        inference = Inference(fabric, config, model, tokenizer)
-        generate_samples_func = inference.generate_samples
-    else:
-        generate_samples_func = None
-
     # wandb login
     if (
         config.trainer.log_to_wandb
@@ -148,12 +142,19 @@ def do_train(
 
     # Create model and trainer
     model = initialize_model(fabric, config, tokenizer, initialize_optimizer=True)
+    inference = Inference(fabric, config, model, tokenizer)
+    generate_samples_func = (
+        inference.generate_samples
+        if config.use_bst and config.trainer.print_samples
+        else None
+    )
     trainer = Trainer(
         fabric=fabric,
         config=config,
         model=model,
         show_progress_bar=(fabric.local_rank == 0 and not hide_progress_bar),
         generate_samples_func=generate_samples_func,
+        evaluate_token_metrics_func=inference.evaluate_token_metrics,
     )
 
     # Start training

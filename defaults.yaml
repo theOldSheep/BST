@@ -71,7 +71,7 @@ data:
   stargraph_max_nodes: 50
 
 model:
-  # "gpt" or "feature_rnn" when use_bst is false
+  # "gpt" or "normalized" when use_bst is false
   architecture: gpt
   n_layer: 8
   n_head: 8
@@ -97,7 +97,7 @@ model:
   # What to predict for gap size 1: "next_token" or "eos"
   bst_single_gap_prediction_mode: eos
 
-  # Feature RNN specific options
+  # Normalized transformer options
   # Feature selecion layers - count , head and backward mask window size
   feature_selection_layers: 4
   feature_selection_heads: 4
@@ -106,12 +106,10 @@ model:
   rope_enabled_for_inference: true
   recurrent_inference: false
   use_vanilla_attn: true
-  n_fixed_feature_embeddings: 16
+  n_fixed_embeddings: 16
   # U and V for operation transformation, with UV = n_model and U > V 
   n_model_split_u: 32
   n_model_split_v: 24
-  omit_u_matrix: false
-  omit_v_matrix: false
   orthogonal_regularization_factor: 0.0
 
   # GPT specific options
