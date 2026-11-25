@@ -168,7 +168,7 @@ class StarGraphDataModule:
             self.test_dataset,
             batch_size=self.batch_size,
             shuffle=False,
-            drop_last=True,
+            drop_last=False,
             collate_fn=self.collate_fn,
         )
         # This will automatically partition data between devices

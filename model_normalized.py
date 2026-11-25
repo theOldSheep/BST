@@ -35,6 +35,10 @@ from model_base import (
     MaskedIndexINorm,
 )
 
+REFLECTION_FLAT_PROB = 0.5
+REFLECTION_FLAG_LOSS_MULTI = 1.0
+REFLECTION_INFERENCE_LOSS_MULTI = 1.0
+
 
 @dataclass
 class NormalizedTransformerConfig:
@@ -133,7 +137,6 @@ class LambdaAttention(nn.Module):
             self.op_v = nn.Parameter(
                 torch.empty(n_head * n_model_split_v, self.head_dim, dtype=dtype)
             )
-        self.logit_norm = MaskedIndexINorm()
         self.norm_variance = nn.Parameter(
             torch.ones(n_head, dtype=dtype)
         )
@@ -207,10 +210,7 @@ class LambdaAttention(nn.Module):
                 query, keys, rope
             )
 
-        scores = torch.einsum('bhim,bhjm->bhij', query, keys)
-        scores = self.logit_norm(scores, mask)
-        # multiply batch, head, i, j by 1,h,1,1 var.
-        scores = scores * torch.sqrt(self.norm_variance).view(1, -1, 1, 1)
+        scores = torch.einsum('bhim,bhjm->bhij', query, keys) / self.sqrt_head_dim
         scores = scores.masked_fill(~mask[None, None, :, :], float('-inf'))
 
         # Softmax into attn scores
@@ -304,11 +304,8 @@ class LambdaAttention(nn.Module):
         mask_fwd = mask.clone()
         mask_back = mask.clone()
         mask_fwd.fill_diagonal_(False)
-        scores = torch.concat( (scores_fwd, scores_back), dim=-1 )
+        scores = torch.concat( (scores_fwd, scores_back), dim=-1 ) / self.sqrt_head_dim
         mask_total = torch.concat( (mask_fwd, mask_back), dim=-1 )
-        scores = self.logit_norm(scores, mask_total)
-        # multiply batch, head, i, j by 1,h,1,1 var.
-        scores = scores * torch.sqrt(self.norm_variance).view(1, -1, 1, 1)
         scores = scores.masked_fill(~mask_total[None, None, :, :], float('-inf'))
         # print(f"score_fwd: \n{scores_fwd}")
         # print(f"score_b: \n{scores_back}")
@@ -466,6 +463,9 @@ class NormalizedTransformer(FusedCrossEntropyLoss, nn.Module):
         self.lm_head = nn.Linear(
             config.n_embd, config.vocab_size, bias=False, dtype=config.dtype
         )
+        self.has_error_head = nn.Linear(
+            config.n_embd, 2, bias=False, dtype=config.dtype
+        )
 
         self.apply(self._init_weights)
 
@@ -510,7 +510,7 @@ class NormalizedTransformer(FusedCrossEntropyLoss, nn.Module):
         dists = positions[:, None] - positions[None, :] # i - j
         seq_to_seq = (dists >= 0) & (
             dists <= self.config.feature_selection_backward_distance
-        )
+        )# & (positions <= self.config.context_length) # TODO: context-only causal mask?
         seq_to_aug = torch.ones(
             seq_len,
             self.config.n_fixed_embeddings,
@@ -541,6 +541,9 @@ class NormalizedTransformer(FusedCrossEntropyLoss, nn.Module):
         seq_to_seq = torch.tril(
             torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
         )
+        # positions = torch.arange(seq_len, device=device)
+        # seq_to_seq = seq_to_seq & \
+        #    (positions <= self.config.context_length) # TODO: context-only causal mask?
         seq_to_aug = torch.ones(
             seq_len,
             self.config.n_fixed_embeddings,
@@ -559,6 +562,137 @@ class NormalizedTransformer(FusedCrossEntropyLoss, nn.Module):
         targets: Optional[torch.Tensor] = None,
         return_accuracy: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        batch_size, seq_len = batch.shape
+        # The "regular" forward pass
+        x = self._forward_blocks_before_head(batch)
+        # For inference, just return
+        if targets is None:
+            return self.lm_head(x)
+        # Forward - CE loss for token ID
+        loss = self.cross_entropy_loss(x, self.lm_head, targets)
+        if self.config.orthogonal_regularization_factor > 0:
+            loss = loss + (
+                self.config.orthogonal_regularization_factor
+                * self.orthogonal_regularization_loss()
+            )
+        # Forward - CE loss for has_error verdict (all "None" = 0)
+        valid_mask = targets != -100
+        has_fault_targets = torch.where(valid_mask, 0, -100)
+        loss = loss + self.cross_entropy_loss(
+            x, self.has_error_head, has_fault_targets
+        )
+
+        # Don't accidentally calc the grad when preparing the reflection batch
+        batch_reflection = None
+        with torch.no_grad():
+            logits = self.lm_head(x)  # (Batch, Seq_len, Vocab_size)
+            probs = torch.softmax(logits, dim=-1)
+            accuracy = logits.argmax(dim=-1) == targets
+            accuracy.masked_fill_(~valid_mask, False)
+
+            # Prevent neg mask crash gather
+            safe_targets = targets.clamp(min=0)
+            target_probs = torch.gather(
+                probs, dim=-1, index=safe_targets.unsqueeze(-1)
+            ).squeeze(-1)
+
+            # (Batch, Seq_len) -> 1 - P(target[b,s])
+            positional_sample_weight = (1.0 - target_probs)
+            # Flat rate = FLAT_PROB / n_unmasked, i.e. FLAT_PROB of epsilon-exploration
+            num_valid = valid_mask.sum(dim=-1, keepdim=True).clamp(min=1)
+            pos_sample_eps = REFLECTION_FLAT_PROB / num_valid
+            positional_sample_weight = positional_sample_weight + pos_sample_eps
+            positional_sample_weight = positional_sample_weight.masked_fill(
+                ~valid_mask, 0.0
+            )
+            # Also fill the EOS position (last token) in each sequence as 0
+            positional_sample_weight[:, -1] = 0.0
+            # For each batch item, randomly sample a swapping index
+            # (Batch, 1) -> sampled replacement sequence pos index
+            mispred_seq_indexes = torch.multinomial(
+                positional_sample_weight.float(), num_samples=1
+            )
+            # For the selected misprediction index, generate misprediction tokens' probability
+            # (Batch, 1, vocab_ID) -> P(target[b,swap_idx[b],token]) | token != target
+            idx_expanded = mispred_seq_indexes.unsqueeze(-1).expand(-1, 1, probs.size(-1))
+            sampled_probs = torch.gather(probs, dim=1, index=idx_expanded).squeeze(1)
+            # Add flat rate = FLAT_PROB / n_vocab, i.e. FLAT_PROB of epsilon-exploration
+            sampled_probs = sampled_probs + REFLECTION_FLAT_PROB / self.config.vocab_size
+            # The correct token is already covered in forward pass 1, don't bother sampling them
+            swapped_targets = torch.gather(safe_targets, dim=1, index=mispred_seq_indexes)  # (B, 1)
+            sampled_probs.scatter_(dim=-1, index=swapped_targets, value=0.0)
+
+            # (Batch, 1, 1) -> sampled replacement token vocab ID
+            swap_vocab_id = torch.multinomial(
+                sampled_probs.float(), num_samples=1
+            )
+            
+            batch_reflection = batch.clone()
+            batch_indices = torch.arange(batch_size, device=batch.device)
+            batch_reflection[batch_indices, mispred_seq_indexes.squeeze(-1) + 1] = swap_vocab_id.squeeze(-1)
+            
+            seq_positions = torch.arange(seq_len, device=batch.device).unsqueeze(0)
+            fault_mask = seq_positions == mispred_seq_indexes + 1
+            has_fault_targets_2 = torch.where(
+                valid_mask, torch.where(fault_mask, 1, 0), -100
+            )
+            # For reflection, only have grad on exactly the mis-prediction's next token pred
+            reflection_targets = torch.where(
+                fault_mask, targets, -100
+            )
+            reflection_targets = targets
+
+        # Training on the misprediction-corrupted sequence
+        if batch_reflection is not None:
+            x_reflection = self._forward_blocks_before_head(batch_reflection)
+            loss = loss + (
+                REFLECTION_FLAG_LOSS_MULTI * 
+                self.cross_entropy_loss(
+                    x_reflection, self.has_error_head, has_fault_targets_2
+                )
+            )
+            loss = loss + (
+                REFLECTION_INFERENCE_LOSS_MULTI * 
+                self.cross_entropy_loss(
+                    x_reflection, 
+                    self.lm_head, 
+                    reflection_targets,
+                    
+                )
+            )
+            import random
+            if random.randint(0, 50) == 1:
+                refl_flg = self.has_error_head(x_reflection)
+                refl_prob = torch.softmax(refl_flg, dim=-1)
+                refl_flg_target_prob = torch.gather(
+                    refl_prob, dim=-1, index=has_fault_targets_2.clamp(min=0).unsqueeze(-1)
+                ).squeeze(-1)
+                refl_logits = self.lm_head(x_reflection)
+                refl_vocab_prob = torch.softmax(refl_logits, dim=-1)
+                refl_vocab_target_prob = torch.gather(
+                    refl_vocab_prob, dim=-1, index=safe_targets.unsqueeze(-1)
+                ).squeeze(-1)
+                print("batch", batch.shape, batch[0])
+                print("tgt", targets.shape, targets[0])
+                # print("probs", probs.shape, probs[0])
+                # print("logits", logits.shape, logits[0])
+                print("positional sample weight", positional_sample_weight.shape, positional_sample_weight[0])
+                print("positional sampled indexes", mispred_seq_indexes.shape, mispred_seq_indexes[0])
+                print("vocab sample probs", sampled_probs.shape, sampled_probs[0])
+                print("vocab sampled ID", swap_vocab_id.shape, swap_vocab_id[0])
+                print("replaced batch", batch_reflection.shape, batch_reflection[0])
+                print("replaced tgt", reflection_targets.shape, reflection_targets[0])
+                print("replaced fault target", has_fault_targets_2.shape, has_fault_targets_2[0])
+                print("replaced fault target prob", refl_prob.shape, refl_flg_target_prob[0])
+                print("replaced vocab true target prob", refl_vocab_target_prob.shape, refl_vocab_target_prob[0])
+
+        if return_accuracy:
+            return loss, accuracy
+        return loss
+
+    def _forward_blocks_before_head(self, batch):
+        # Factored out to handle all calculations starting from token ID
+        # Does not handle the text heads / pred heads
         batch_size, seq_len = batch.shape
         if seq_len > self.config.block_size:
             raise ValueError(
@@ -597,21 +731,7 @@ class NormalizedTransformer(FusedCrossEntropyLoss, nn.Module):
             )
         x = self.transformer.norm(x)
 
-        if targets is None:
-            return self.lm_head(x)
-        loss = self.cross_entropy_loss(x, self.lm_head, targets)
-        if self.config.orthogonal_regularization_factor > 0:
-            loss = loss + (
-                self.config.orthogonal_regularization_factor
-                * self.orthogonal_regularization_loss()
-            )
-        if return_accuracy:
-            with torch.no_grad():
-                logits = self.lm_head(x.reshape(-1, x.size(-1)))
-                accuracy = logits.argmax(dim=-1).reshape_as(targets) == targets
-                accuracy.masked_fill_(targets == -100, False)
-            return loss, accuracy
-        return loss
+        return x
 
 
 class NormalizedModel(ModelBase):
@@ -657,15 +777,15 @@ class NormalizedModel(ModelBase):
         targets = batch[:, 1:]
         # Based on experiment, masking out prediction on prefix helps convergence on the entropy-free targets
         # Unlike raw GPT, it does not need to augment gradient on the exposition
-        if not 0 <= self.config.context_length < targets.size(1):
-            raise ValueError(
-                f"context_length must be in [0, {targets.size(1) - 1}], "
-                f"got {self.config.context_length}"
-            )
-        target_positions = torch.arange(targets.size(1), device=targets.device)
-        targets = targets.masked_fill(
-            (target_positions < self.config.context_length).unsqueeze(0), -100
-        )
+        # if not 0 <= self.config.context_length < targets.size(1):
+        #     raise ValueError(
+        #         f"context_length must be in [0, {targets.size(1) - 1}], "
+        #         f"got {self.config.context_length}"
+        #     )
+        # target_positions = torch.arange(targets.size(1), device=targets.device)
+        # targets = targets.masked_fill(
+        #     (target_positions < self.config.context_length).unsqueeze(0), -100
+        # )
 
         if backpropagate and self._pair_accuracy_counts is None:
             self._pair_accuracy_counts = torch.zeros(

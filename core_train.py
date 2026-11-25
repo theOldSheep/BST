@@ -2,6 +2,7 @@
 
 import gc
 import inspect
+import json
 import math
 import os
 import torch
@@ -17,10 +18,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from model_base import ModelBase
 from model_bst import BST, BSTConfig
 from model_gpt import GPT, GPTConfig, Block
-from model_feature_rnn import (
-    FeatureRNN,
-    FeatureRNNConfig,
-    FeatureRNNBlock,
+from model_normalized import (
+    NormalizedModel,
+    NormalizedTransformerConfig,
+    NormalizedTransformerBlock,
 )
 
 # flaatten the metric json - make the csv more readable with more columns
@@ -71,9 +72,9 @@ def initialize_model(
         if config.model.architecture == "gpt":
             ModelClass = GPT
             ModelConfigClass = GPTConfig
-        elif config.model.architecture == "feature_rnn":
-            ModelClass = FeatureRNN
-            ModelConfigClass = FeatureRNNConfig
+        elif config.model.architecture == "normalized":
+            ModelClass = NormalizedModel
+            ModelConfigClass = NormalizedTransformerConfig
         else:
             raise ValueError(
                 f"Unknown model architecture: {config.model.architecture}"
@@ -107,55 +108,45 @@ def initialize_model(
             "bst_pair_subsample_rate": config.model.bst_pair_subsample_rate,
             "bst_single_gap_prediction_mode": config.model.bst_single_gap_prediction_mode,
         }
-    elif config.model.architecture in {"feature_rnn"}:
+    elif config.model.architecture in {"normalized"}:
         if config.model.gpt_mode != "next_token":
             raise ValueError(
                 f"{config.model.architecture} supports only next-token mode; "
                 "FIM infilling is not supported."
             )
         model_args.pop("eos_token_id")
-        feature_defaults = FeatureRNNConfig()
+        config_defaults = NormalizedTransformerConfig()
         model_args.update(
             context_length=config.model.context_length,
             feature_selection_layers=config.model.get(
-                "feature_selection_layers", feature_defaults.feature_selection_layers
+                "feature_selection_layers", config_defaults.feature_selection_layers
             ),
             feature_selection_heads=config.model.get(
-                "feature_selection_heads", feature_defaults.feature_selection_heads
+                "feature_selection_heads", config_defaults.feature_selection_heads
             ),
             feature_selection_backward_distance=config.model.get(
                 "feature_selection_backward_distance",
-                feature_defaults.feature_selection_backward_distance,
+                config_defaults.feature_selection_backward_distance,
             ),
             rope_enabled_for_inference=config.model.get(
                 "rope_enabled_for_inference",
-                feature_defaults.rope_enabled_for_inference,
+                config_defaults.rope_enabled_for_inference,
             ),
             recurrent_inference=config.model.get(
-                "recurrent_inference", feature_defaults.recurrent_inference
+                "recurrent_inference", config_defaults.recurrent_inference
             ),
             use_vanilla_attn=config.model.get(
-                "use_vanilla_attn", feature_defaults.use_vanilla_attn
-            ),
-            n_fixed_feature_embeddings=config.model.get(
-                "n_fixed_feature_embeddings",
-                feature_defaults.n_fixed_feature_embeddings,
+                "use_vanilla_attn", config_defaults.use_vanilla_attn
             ),
             n_model_split_u=config.model.get(
-                "n_model_split_u", feature_defaults.n_model_split_u
+                "n_model_split_u", config_defaults.n_model_split_u
             ),
             n_model_split_v=config.model.get(
-                "n_model_split_v", feature_defaults.n_model_split_v
-            ),
-            omit_u_matrix=config.model.get(
-                "omit_u_matrix", feature_defaults.omit_u_matrix
-            ),
-            omit_v_matrix=config.model.get(
-                "omit_v_matrix", feature_defaults.omit_v_matrix
+                "n_model_split_v", config_defaults.n_model_split_v
             ),
             orthogonal_regularization_factor=config.model.get(
                 "orthogonal_regularization_factor",
-                feature_defaults.orthogonal_regularization_factor,
+                config_defaults.orthogonal_regularization_factor,
             ),
         )
     else:
@@ -312,7 +303,7 @@ def shard_model(
                 submodule,
                 (
                     Block,
-                    FeatureRNNBlock,
+                    NormalizedTransformerBlock,
                 ),
             ):
                 submodule = fully_shard(
@@ -342,6 +333,7 @@ class Trainer:
         model: ModelBase,
         show_progress_bar: bool = True,
         generate_samples_func: Optional[Callable] = None,
+        evaluate_token_metrics_func: Optional[Callable] = None,
     ):
         # Check that model has optimizer
         assert (
@@ -354,6 +346,7 @@ class Trainer:
         self.model = model
         self.show_progress_bar = show_progress_bar
         self.generate_samples_func = generate_samples_func
+        self.evaluate_token_metrics_func = evaluate_token_metrics_func
 
         # Training loop state
         self.train_dataloader: DataLoader = None
@@ -400,6 +393,20 @@ class Trainer:
 
             self.fabric.print("Training complete, running final validation")
             val_logs = self._validation_loop()
+
+            test_dataloader_func = getattr(datamodule, "test_dataloader", None)
+            if callable(test_dataloader_func):
+                self._evaluate_and_save_token_metrics(
+                    test_dataloader_func(),
+                    eval_type="test",
+                    filename="test_metrics.json",
+                    num_samples=None,
+                )
+            else:
+                self.fabric.print(
+                    f"{type(datamodule).__name__} does not provide a test split; "
+                    "skipping final test evaluation"
+                )
 
             # Save final model checkpoint as wandb artifact
             if self.config.trainer.log_to_wandb and self.fabric.global_rank == 0:
@@ -657,6 +664,15 @@ class Trainer:
         # Add validation loss to log
         validation_logs["val_loss"] = val_loss
 
+        if self.evaluate_token_metrics_func is not None:
+            eval_samples = self.config.trainer.val_batches
+            self._evaluate_and_save_token_metrics(
+                self.val_dataloader,
+                eval_type="eval",
+                filename=f"eval_metrics_step_{self.step}.json",
+                num_samples=eval_samples if eval_samples > 0 else None,
+            )
+
         # For BST, also compute next/prev token prediction loss
         if isinstance(self.model, BST):
             val_loss_next_token, val_loss_prev_token = self._bst_next_prev_token_loss()
@@ -683,7 +699,12 @@ class Trainer:
                 and self.step in self.config.trainer.keep_checkpoint_steps
             )
         ):
-            filename = f"ckpt_iter_{self.step}_loss_{val_loss}.pt"
+            save_as_best = self.config.trainer.save_best_checkpoint and is_new_best
+            filename = (
+                "ckpt.pt"
+                if save_as_best
+                else f"ckpt_iter_{self.step}_loss_{val_loss}.pt"
+            )
             new_ckpt_path = self._save_checkpoint(filename)
 
             # Delete outdated checkpoints
@@ -706,7 +727,10 @@ class Trainer:
                     old_checkpoints.add(self.best_checkpoint_path)
                 if self.fabric.global_rank == 0:
                     for ckpt in old_checkpoints:
-                        if ckpt not in self.checkpoints_to_always_keep:
+                        if (
+                            ckpt != new_ckpt_path
+                            and ckpt not in self.checkpoints_to_always_keep
+                        ):
                             os.remove(ckpt)
 
             # Update latest and best checkpoint paths
@@ -730,6 +754,35 @@ class Trainer:
             )
 
         return validation_logs
+
+    def _evaluate_and_save_token_metrics(
+        self,
+        dataloader: DataLoader,
+        eval_type: str,
+        filename: str,
+        num_samples: Optional[int],
+    ) -> None:
+        # self.fabric.print(f"Evaluation type: {eval_type}, file name: {filename}, {num_samples} samples")
+        if self.evaluate_token_metrics_func is None:
+            return
+
+        results = self.evaluate_token_metrics_func(
+            dataloader, eval_type, num_samples
+        )
+        # self.fabric.print(f"Eval result: {results}")
+        if self.fabric.global_rank == 0:
+            output_dir = os.path.join(
+                self.config.trainer.out_dir,
+                self.config.trainer.experiment_name,
+            )
+            output_path = os.path.join(output_dir, filename)
+            # self.fabric.print(f"Eval output dir(path): {output_dir} ({output_path})")
+            with open(output_path, "w", encoding="utf-8") as output_file:
+                json.dump(
+                    {"step": self.step, "metrics": results},
+                    output_file,
+                    indent=2,
+                )
 
     @torch.inference_mode()
     def _bst_next_prev_token_loss(self) -> Tuple[float, float]:

@@ -106,7 +106,6 @@ model:
   rope_enabled_for_inference: true
   recurrent_inference: false
   use_vanilla_attn: true
-  n_fixed_embeddings: 16
   # U and V for operation transformation, with UV = n_model and U > V 
   n_model_split_u: 32
   n_model_split_v: 24
